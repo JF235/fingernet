@@ -303,13 +303,17 @@ class FingerNetWrapper(nn.Module):
 
     def postprocess(self, outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
         # 1. Binarização e limpeza da máscara de segmentação
+        t1 = time.time()
         cleaned_mask = self._post_binarize_mask(outputs['segmentation'])
         cleaned_mask_up = self._post_binarize_mask(outputs['segmentation upsample'], upsample_factor=8)
+        t2 = time.time()
 
         # 2. Detecção de minúcias (incluindo NMS)
         # O resultado é uma lista de tensores, um para cada imagem no lote.
         final_minutiae_list = self._post_detect_minutiae(outputs, cleaned_mask, threshold)
-
+        #final_minutiae_list = parallel_matrix_nms(outputs, cleaned_mask, threshold)
+        t3 = time.time()
+        
         # 3. Processamento do campo de orientação
         ori_up = outputs['orientation upsample']
         orientation_field = (torch.argmax(ori_up, dim=1).float() * 2.0 - 90.) * torch.pi / 180.0
@@ -326,6 +330,9 @@ class FingerNetWrapper(nn.Module):
         enh_max = enh_flat.max(dim=1, keepdim=True)[0]
         enh_norm = (enh_flat - enh_min) / (enh_max - enh_min + 1e-8)
         enh_visual = (enh_norm.view(b, h, w) * 255).byte()
+        t4 = time.time()
+
+        #print(f"Postprocess - Mask: {t2 - t1:.4f}s, Minutiae: {t3 - t2:.4f}s, Orientation & Enh: {t4 - t3:.4f}s, Total= {t4 - t1:.4f}s")
 
         return {
             'minutiae': final_minutiae_list,

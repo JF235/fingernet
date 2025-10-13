@@ -51,6 +51,7 @@ def infer_command(args):
     print(f"Workers:     {args.cores} per GPU")
     print(f"Recursive:   {args.recursive}")
     print(f"Compile:     {args.compile}")
+    print(f"Max Dim:     {args.max_dim}")
     print(f"{'='*70}\n")
     
     run_inference(
@@ -62,7 +63,8 @@ def infer_command(args):
         num_workers=args.cores,
         recursive=args.recursive,
         mnt_degrees=args.degrees,
-        compile_model=args.compile
+        compile_model=args.compile,
+        max_image_dim=args.max_dim
     )
 
 
@@ -216,6 +218,7 @@ Examples:
         sp.add_argument('--recursive', '-r', action='store_true', help='Search for images recursively in directories')
         sp.add_argument('--degrees', action='store_true', help='Save minutiae angles in degrees instead of radians')
         sp.add_argument('--compile', action='store_true', help='Compile model with torch.compile for faster inference (experimental)')
+        sp.add_argument('--max-dim', type=int, default=1024, help='Maximum dimension (H or W) for an image before resizing (default: 1024)')
 
     if any(h in sys.argv for h in ('-h', '--help')) and not any(cmd in sys.argv for cmd in subcommand_names):
         subparsers_temp = parser.add_subparsers(dest='command', required=False, help='Command to execute')

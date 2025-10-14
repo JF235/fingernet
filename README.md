@@ -135,3 +135,10 @@ docker run -it --rm -v "$PWD":/workspace/FingerNet fingernet:legacy
 
 # If you need GPU support, add `--gpus all` before `-it`
 ```
+
+```bash
+# Once inside the container
+cd src
+# <GPU> <mode=train/test/deploy>
+python train_test_deploy.py 0 deploy
+```

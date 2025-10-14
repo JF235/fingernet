@@ -1,0 +1,21 @@
+20251014-18:26:14 Predicting 0:
+20251014-18:26:18 0 1 / 1: B101L9U
+20251014-18:26:39 findfont: Matching :family=sans-serif:style=normal:variant=normal:weight=normal:stretch=normal:size=10.0 to DejaVu Sans (u'/usr/local/lib/python2.7/dist-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans.ttf') with score of 0.050000
+20251014-18:26:41 load+conv: 7.759s, seg-postpro+nms: 0.230, draw: 14.870
+20251014-18:26:41 Average: load+conv: 7.759s, oir-select+seg-post+nms: 0.230, draw: 14.870
+20251014-18:26:41 Predicting 1:
+20251014-18:26:45 1 1 / 1: A0100003009991600022036_2
+20251014-18:26:55 load+conv: 3.922s, seg-postpro+nms: 0.412, draw: 4.999
+20251014-18:26:55 Average: load+conv: 3.922s, oir-select+seg-post+nms: 0.412, draw: 4.999
+20251014-18:26:55 Predicting 2:
+20251014-18:27:00 2 1 / 1: 1_1
+20251014-18:27:06 load+conv: 2.970s, seg-postpro+nms: 0.519, draw: 3.034
+20251014-18:27:06 Average: load+conv: 2.970s, oir-select+seg-post+nms: 0.519, draw: 3.034
+20251014-18:27:06 Predicting 3:
+20251014-18:27:12 3 1 / 1: F0001_01
+20251014-18:27:23 load+conv: 4.031s, seg-postpro+nms: 1.723, draw: 5.008
+20251014-18:27:23 Average: load+conv: 4.031s, oir-select+seg-post+nms: 1.723, draw: 5.008
+20251014-18:27:23 Predicting 4:
+20251014-18:27:30 4 1 / 1: F0000001
+20251014-18:27:58 load+conv: 8.297s, seg-postpro+nms: 3.415, draw: 16.301
+20251014-18:27:58 Average: load+conv: 8.297s, oir-select+seg-post+nms: 3.415, draw: 16.301

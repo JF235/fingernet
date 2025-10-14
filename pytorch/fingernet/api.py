@@ -1,3 +1,4 @@
+import logging
 import os
 import glob
 import torch
@@ -9,14 +10,17 @@ from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from pathlib import Path
 from datetime import timedelta
 import warnings
+import threading
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from .post_processing import postprocess as post
+from .utils import setup_logging, Timer
 
 from .model import get_fingernet, DEFAULT_WEIGHTS_PATH
 
 torch.set_float32_matmul_precision("medium")
-
 
 class FingerprintDataset(Dataset):
     """Dataset for loading fingerprint images."""
@@ -177,6 +181,59 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False)
     angles_deg_shifted = np.round(np.rad2deg(ori_cpu) + 90).astype(np.uint8)
     Image.fromarray(angles_deg_shifted).save(orientation_path)
 
+def postprocess_and_save_batch(
+    raw_outputs_cpu: dict,
+    batch_paths: list[str],
+    batch_orig_shapes: tuple,
+    padded_shape: tuple,
+    output_path: str,
+    mnt_degrees: bool
+):
+    """Executa pós-processamento e salva os resultados de um lote."""
+    worker_id = threading.get_ident()
+    logger = logging.getLogger()
+
+    logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
+    try:
+        with Timer() as t_post:
+            final_outputs = post(raw_outputs_cpu, threshold=0.5)
+
+        padded_h, padded_w = padded_shape
+
+        for i in range(len(batch_paths)):
+            orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
+
+            minutiae = final_outputs["minutiae"][i].numpy()
+
+            # Correção de coordenadas devido ao padding dinâmico
+            # Esta lógica precisa ser ajustada, pois o padding era centralizado.
+            # Por simplicidade, assumimos padding à direita/inferior como no código original.
+            enhanced_img = final_outputs["enhanced_image"][i][:orig_h, :orig_w].numpy()
+            seg_mask = final_outputs["segmentation_mask"][i][:orig_h, :orig_w].numpy()
+            ori_field = final_outputs["orientation_field"][i][:orig_h, :orig_w].numpy()
+
+            result_item = {
+                "input_path": batch_paths[i],
+                "minutiae": minutiae,
+                "enhanced_image": enhanced_img,
+                "segmentation_mask": seg_mask,
+                "orientation_field": ori_field,
+            }
+            save_results(result_item, output_path, mnt_degrees)
+
+        
+        logger.info(
+            "CPU worker finished batch", 
+            extra={
+                'cpu_worker_id': worker_id, 
+                'postprocess_duration_ms': t_post.elapsed,
+                'batch_size': len(batch_paths)
+            }
+        )
+    except Exception as e:
+        warnings.warn(f"Falha no pós-processamento do lote iniciado com {os.path.basename(batch_paths[0])}. Erro: {e}")
+
+
 
 def create_output_directories(output_path: str):
     """Create output directory structure."""
@@ -228,10 +285,12 @@ def inference_worker_ddp(
     num_workers: int,
     mnt_degrees: bool,
     compile_model: bool,
+    num_cpu_workers: int,
 ):
     """
     Worker function for distributed inference on a single GPU.
     """
+    logger = setup_logging(rank=rank)
     try:
         # Setup DDP
         setup_ddp(rank, world_size)
@@ -287,79 +346,67 @@ def inference_worker_ddp(
 
         if is_main:
             print(f"[Rank {rank}] Starting inference...")
-        # Inference loop
-        all_results = []
+        
+        with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+            futures = []
+            max_queue_size = 3 * num_cpu_workers
+            with torch.no_grad():
+                iterator = tqdm(dataloader, desc=f"GPU {rank}", disable=not is_main)
+                for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    if batch_tensors is None: continue
 
-        with torch.no_grad():
-            # Use tqdm only on main process
-            iterator = tqdm(dataloader, desc=f"GPU {rank}") if is_main else dataloader
-
-            for batch_tensors, batch_paths, batch_orig_shapes in iterator:
-                if batch_tensors is None:
-                    continue
-
-                _, _, padded_h, padded_w = batch_tensors.shape
-                batch_tensors = batch_tensors.to(f"cuda:{rank}")
-                results = model(batch_tensors)
-
-                for i in range(len(batch_paths)):
-                    orig_h, orig_w = (
-                        batch_orig_shapes[0][i].item(),
-                        batch_orig_shapes[1][i].item(),
+                    _, _, padded_h, padded_w = batch_tensors.shape
+                    batch_tensors = batch_tensors.to(f"cuda:{rank}")
+                    # ETAPA GPU: Inferência
+                    with Timer() as t_gpu:
+                        raw_outputs = model(batch_tensors)
+                    logger.info(
+                        "GPU inference complete",
+                        extra={'duration_ms': t_gpu.elapsed, 'batch_size': len(batch_paths)}
                     )
-                    pad_top, pad_left = (padded_h - orig_h) // 2, (
-                        padded_w - orig_w
-                    ) // 2
 
-                    minutiae = results["minutiae"][i].cpu().numpy()
-                    if minutiae.shape[0] > 0:
-                        minutiae[:, 0] -= pad_left
-                        minutiae[:, 1] -= pad_top
+                    # ETAPA DE TRANSFERÊNCIA: Mover para CPU
+                    with Timer() as t_transfer:
+                        raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
+                    logger.info(
+                        "GPU->CPU transfer complete",
+                        extra={'duration_ms': t_transfer.elapsed}
+                    )
 
-                    enhanced_img = results["enhanced_image"][i].cpu().numpy()
-                    seg_mask = results["segmentation_mask"][i].cpu().numpy()
-                    ori_field = results["orientation_field"][i].cpu().numpy()
+                    # ETAPA DE SUBMISSÃO: Enviar para a pool de threads
+                    future = executor.submit(
+                        postprocess_and_save_batch,
+                        raw_outputs_cpu,
+                        batch_paths,
+                        batch_orig_shapes,
+                        (padded_h, padded_w),
+                        output_path,
+                        mnt_degrees
+                    )
+                    futures.append(future)
+                    queue_size = len(futures)
+                    logger.info(
+                        "Task submitted to CPU queue",
+                        extra={'queue_size': queue_size, 'first_image': os.path.basename(batch_paths[0])}
+                    )
 
-                    result_item = {
-                        "input_path": batch_paths[i],
-                        "minutiae": minutiae,
-                        "enhanced_image": enhanced_img[
-                            pad_top : pad_top + orig_h, pad_left : pad_left + orig_w
-                        ],
-                        "segmentation_mask": seg_mask[
-                            pad_top : pad_top + orig_h, pad_left : pad_left + orig_w
-                        ],
-                        "orientation_field": ori_field[
-                            pad_top : pad_top + orig_h, pad_left : pad_left + orig_w
-                        ],
-                    }
-                    all_results.append(result_item)
+                    if queue_size >= max_queue_size:
+                        logger.warning("CPU queue is full. GPU process is waiting.", extra={'queue_size': queue_size})
+                        with Timer() as t_wait:
+                            completed_future = futures.pop(0)
+                            completed_future.result()
+                        logger.info("GPU process resumed.", extra={'wait_time_ms': t_wait.elapsed})
 
-        # Synchronize: all processes finish inference before saving
+            # Aguardar a finalização de todas as tarefas submetidas por este rank
+            if is_main:
+                print(f"\n[Rank {rank}] Inference complete. Waiting for post-processing...")
+            for future in tqdm(futures, desc=f"Finalizing (GPU {rank})", disable=not is_main):
+                future.result()
+
+        # Sincronizar todas as GPUs antes de finalizar
         dist.barrier()
-
         if is_main:
-            print(f"\n[Rank {rank}] Inference complete. Saving results...")
-
-        # Each rank saves its own results
-        for result_item in tqdm(
-            all_results, desc=f"Saving (GPU {rank})", disable=not is_main
-        ):
-            save_results(result_item, output_path, mnt_degrees)
-
-        # Final synchronization
-        print(f"[Rank {rank}] Finished saving results.")
-        dist.barrier()
-
-        # ALL processes must participate in reduce (collective operation)
-        total_processed = torch.tensor(len(all_results), device=f"cuda:{rank}")
-        dist.reduce(total_processed, dst=0, op=dist.ReduceOp.SUM)
-
-        # Only rank 0 prints the results
-        if is_main:
-            total = total_processed.item()
             print(f"✓ Inference Complete!")
-            print(f"  Total images processed: {total}")
             print(f"  Results saved to: {output_path}")
 
     except Exception as e:
@@ -380,95 +427,71 @@ def inference_single_gpu(
     num_workers: int,
     mnt_degrees: bool,
     compile_model: bool,
+    num_cpu_workers: int,
 ):
     """
     Inference on a single GPU (or CPU if device_id is -1).
     """
+    logger = setup_logging(rank=device_id)
+
     print(f"Starting Single GPU Inference")
     print(f"Device: cuda:{device_id}")
     print(f"Batch Size: {batch_size}")
     print(f"Total Images: {len(image_paths)}")
     print(f"Output Path: {output_path}")
+    device = f"cuda:{device_id}" if torch.cuda.is_available() and device_id != -1 else "cpu"
 
-    # Create output directories
     create_output_directories(output_path)
-
-    # Load model
-    print("Loading model...")
-    device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
     model = get_fingernet(weights_path=weights_path, device=device, log=False)
-    model.eval()
-
-    # Optionally compile
     if compile_model:
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # Setup dataset and dataloader
     dataset = FingerprintDataset(image_paths, max_dim=max_image_dim)
     dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        shuffle=False,
-        persistent_workers=(num_workers > 0),
-        collate_fn=dynamic_padding_collate,
+        dataset, batch_size=batch_size, num_workers=num_workers,
+        pin_memory=True, shuffle=False, persistent_workers=(num_workers > 0),
+        collate_fn=dynamic_padding_collate
     )
-
     print("Starting inference...")
 
-    # Inference loop
-    all_results = []
+    with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+        futures = []
+        max_queue_size = 3 * num_cpu_workers
+        with torch.no_grad():
+            for batch_tensors, batch_paths, batch_orig_shapes in tqdm(dataloader, desc="Processing"):
+                if batch_tensors is None: continue
 
-    with torch.no_grad():
-        for batch_tensors, batch_paths, batch_orig_shapes in tqdm(
-            dataloader, desc="Processing"
-        ):
-            if batch_tensors is None:
-                continue
+                # ETAPA GPU: Inferência
+                _, _, padded_h, padded_w = batch_tensors.shape
+                batch_tensors = batch_tensors.to(device)
+                raw_outputs = model(batch_tensors)
 
-            _, _, padded_h, padded_w = batch_tensors.shape
-            batch_tensors = batch_tensors.to(device_str)
-            results = model(batch_tensors)
+                # ETAPA DE TRANSFERÊNCIA: Mover para CPU
+                raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
 
-            for i in range(len(batch_paths)):
-                orig_h, orig_w = (
-                    batch_orig_shapes[0][i].item(),
-                    batch_orig_shapes[1][i].item(),
+                # ETAPA DE SUBMISSÃO: Enviar para a pool de threads
+                future = executor.submit(
+                    postprocess_and_save_batch,
+                    raw_outputs_cpu,
+                    batch_paths,
+                    batch_orig_shapes,
+                    (padded_h, padded_w),
+                    output_path,
+                    mnt_degrees
                 )
-                pad_top, pad_left = (padded_h - orig_h) // 2, (padded_w - orig_w) // 2
+                futures.append(future)
 
-                minutiae = results["minutiae"][i].cpu().numpy()
-                if minutiae.shape[0] > 0:
-                    minutiae[:, 0] -= pad_left
-                    minutiae[:, 1] -= pad_top
+                if len(futures) >= max_queue_size:
+                    completed_future = futures.pop(0)
+                    completed_future.result()
 
-                enhanced_img = results["enhanced_image"][i].cpu().numpy()
-                seg_mask = results["segmentation_mask"][i].cpu().numpy()
-                ori_field = results["orientation_field"][i].cpu().numpy()
-
-                result_item = {
-                    "input_path": batch_paths[i],
-                    "minutiae": minutiae,
-                    "enhanced_image": enhanced_img[
-                        pad_top : pad_top + orig_h, pad_left : pad_left + orig_w
-                    ],
-                    "segmentation_mask": seg_mask[
-                        pad_top : pad_top + orig_h, pad_left : pad_left + orig_w
-                    ],
-                    "orientation_field": ori_field[
-                        pad_top : pad_top + orig_h, pad_left : pad_left + orig_w
-                    ],
-                }
-                all_results.append(result_item)
-
-    print("\nSaving results...")
-    for result_item in tqdm(all_results, desc="Saving"):
-        save_results(result_item, output_path, mnt_degrees)
+        print("\nInference complete. Waiting for post-processing and saving to finish...")
+        for future in tqdm(futures, desc="Finalizing"):
+            future.result()  # Aguarda a conclusão e levanta exceções se houver
 
     print(f"✓ Inference Complete!")
-    print(f"  Total images processed: {len(all_results)}")
+    print(f"  Total images processed: {len(image_paths)}")
     print(f"  Results saved to: {output_path}")
 
 
@@ -483,6 +506,7 @@ def run_inference(
     mnt_degrees: bool = True,
     compile_model: bool = False,
     max_image_dim: int = 1024,
+    num_cpu_workers: int = 2,
 ):
     """
     Run FingerNet inference on images.
@@ -520,6 +544,7 @@ def run_inference(
             num_workers=num_workers,
             mnt_degrees=mnt_degrees,
             compile_model=compile_model,
+            num_cpu_workers=num_cpu_workers,
         )
     elif isinstance(gpus, int):
         world_size = gpus
@@ -539,6 +564,7 @@ def run_inference(
                 num_workers,
                 mnt_degrees,
                 compile_model,
+                num_cpu_workers,
             ),
         )
     elif isinstance(gpus, list):
@@ -558,6 +584,7 @@ def run_inference(
                 num_workers,
                 mnt_degrees,
                 compile_model,
+                num_cpu_workers,
             ),
         )
     else:

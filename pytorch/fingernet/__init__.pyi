@@ -1,6 +1,8 @@
 from .api import run_inference
-from .model import FingerNetWrapper, get_fingernet, get_fingernet_core
+from .model import get_fingernet_core, FingerNet
+from .wrapper import get_fingernet, FingerNetWrapper
 from .plot import plot_output
+from .fnet_utils import get_fingernet_logger, FnetTimer
 
 __all__ = [
     'run_inference',
@@ -8,4 +10,6 @@ __all__ = [
     'get_fingernet_core',
     'FingerNetWrapper',
     'plot_output',
+    'get_fingernet_logger',
+    'FnetTimer',
 ]

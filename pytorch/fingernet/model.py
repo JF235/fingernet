@@ -1,18 +1,13 @@
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from scipy import signal
-from PIL import Image
 import os
 import kornia
+from .fnet_utils import get_fingernet_logger, FnetTimer, logging, DEFAULT_DEVICE, DEFAULT_WEIGHTS_PATH
 
-DEFAULT_WEIGHTS_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../..", "models", "released_version", "Model.pth")
-)
-
-DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+logger = get_fingernet_logger(__name__, level=logging.INFO)
 
 class ImgNormalization(nn.Module):
     def __init__(self, m0=0.0, var0=1.0):
@@ -227,27 +222,29 @@ class FingerNet(nn.Module):
             'minutiae_y_offset': mnt_h,
             'minutiae_score': mnt_s
         }
-    
+
     def time(self, x: torch.Tensor):
         """Define o fluxo de dados e retorna um dicionário com todas as saídas."""
         # Etapas do pipeline
-        t1 = time.time()
+        
         x_norm = self.img_norm(x)
-        t2 = time.time()
-        features = self.feature_extractor(x_norm)
-        t3 = time.time()
-        ori_map, seg_map = self.ori_seg_head(features)
-        t4 = time.time()
-        enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
-        t5 = time.time()
+
+        with FnetTimer("Feature Extraction", logger):
+            features = self.feature_extractor(x_norm)
+
+        with FnetTimer("Orientation and Segmentation Head", logger):
+            ori_map, seg_map = self.ori_seg_head(features)
+
+        with FnetTimer("Enhancement Module", logger):
+            enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
+
         upsampled_seg = F.interpolate(nn.functional.softsign(seg_map), scale_factor=8, mode='nearest')
         upsampled_seg_out = F.interpolate(seg_map, scale_factor=8, mode='nearest')
-        minutiae_input = torch.cat([enh_phase, upsampled_seg], dim=1)
-        t6 = time.time()
-        mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
-        t7 = time.time()
 
-        print(f"ImgNorm: {t2 - t1:.4f}s, FeatExt: {t3 - t2:.4f}s, OriSeg: {t4 - t3:.4f}s, EnhMod: {t5 - t4:.4f}s, MinHead: {t7 - t6:.4f}s, Total= {t7 - t1:.4f}s")
+        minutiae_input = torch.cat([enh_phase, upsampled_seg], dim=1)
+        
+        with FnetTimer("Minutiae Head", logger):
+            mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
 
         # Retorna um dicionário com saídas nomeadas para clareza
         return {
@@ -263,101 +260,23 @@ class FingerNet(nn.Module):
             'minutiae_score': mnt_s
         }
 
-class FingerNetWrapper(nn.Module):
-    def __init__(self, model: FingerNet):
-        super().__init__()
-        self.fingernet = model
-
-    def forward(self, x: torch.Tensor, minutiae_threshold: float = 0.5) -> dict[str, torch.Tensor]:
-        
-        padded_x = self.preprocess(x)
-        
-        with torch.no_grad():
-            raw_outputs = self.fingernet(padded_x)
-
-        return raw_outputs
-
-    def time(self, x: torch.Tensor, minutiae_threshold: float = 0.5) -> dict[str, torch.Tensor]:
-        
-        t1 = time.time()
-        padded_x = self.preprocess(x)
-        t2 = time.time()
-
-        with torch.no_grad():
-            raw_outputs = self.fingernet.time(padded_x)
-
-        t3 = time.time()
-        final_outputs = self.postprocess(raw_outputs, threshold=minutiae_threshold)
-        t4 = time.time()
-
-        print(f"Preprocess: {t2 - t1:.4f}s, FingerNet: {t3 - t2:.4f}s, Postprocess: {t4 - t3:.4f}s, Total= {t4 - t1:.4f}s")
-        return final_outputs
-
-    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        _, _, h, w = x.shape
-        pad_h = (8 - h % 8) % 8
-        pad_w = (8 - w % 8) % 8
-        return F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
-
-def get_fingernet_core(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE, log: bool = True) -> FingerNet:
-    """
-    Gets the FingerNet model.
-    """
+def get_fingernet_core(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNet:
     if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Arquivo de pesos não encontrado em: {weights_path}")
+        raise FileNotFoundError(f"Weights file not found at: {weights_path}")
 
-    # 1. Detectar dispositivo
-    if log: print(f"[FingerNet] Dispositivo selecionado: {device}")
-
-    # 2. Instanciar o modelo base
-    if log: print("[FingerNet] Carregando arquitetura FingerNet...")
+    logger.info(f"Selected device: {device}")
+    logger.info("Loading FingerNet architecture...")
     fingernet_model = FingerNet()
 
-    # 3. Carregar os pesos (state_dict)
-    if log: print(f"[FingerNet] Carregando pesos de: {weights_path}")
+    logger.info(f"Loading weights from: {weights_path}")
     fingernet_model.load_state_dict(torch.load(weights_path, map_location=device))
     fingernet_model.eval()
     fingernet_model.to(device)
 
     if device == "cpu":
-        print("[FingerNet] Movendo o modelo para o formato de memória channels_last...")
+        logger.info("Moving model to channels_last memory format...")
         fingernet_model.to(memory_format=torch.channels_last)
 
-    if log: print("\n[FingerNet] Modelo pronto para inferência.")
+    logger.info("Model ready for inference.")
 
     return fingernet_model
-
-def get_fingernet(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE, log: bool = True) -> FingerNetWrapper:
-    """
-    Gets the 
-    1. preloaded, 
-    2. device specific and 
-    3. eval mode 
-    FingerNetWrapper.
-    """
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Arquivo de pesos não encontrado em: {weights_path}")
-
-    # 1. Detectar dispositivo
-    if log: print(f"[FingerNet] Dispositivo selecionado: {device}")
-
-    # 2. Instanciar o modelo base
-    if log: print("[FingerNet] Carregando arquitetura FingerNet...")
-    fingernet_model = FingerNet()
-
-    # 3. Carregar os pesos (state_dict)
-    if log: print(f"[FingerNet] Carregando pesos de: {weights_path}")
-    fingernet_model.load_state_dict(torch.load(weights_path, map_location=device))
-    fingernet_model.eval()
-
-    # 5. Criar e mover o wrapper para o dispositivo
-    if log: print("[FingerNet] Criando e movendo o wrapper para o dispositivo...")
-    fnet_wrapper = FingerNetWrapper(model=fingernet_model).to(device)
-
-    if device == "cpu":
-        print("[FingerNet] Movendo o wrapper para o formato de memória channels_last...")
-        fnet_wrapper.to(memory_format=torch.channels_last)
-
-    if log: print("\n[FingerNet] Modelo pronto para inferência.")
-    
-    return fnet_wrapper

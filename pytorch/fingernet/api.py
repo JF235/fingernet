@@ -15,10 +15,11 @@ import warnings
 import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from .post_processing import postprocess as post
-from .utils import setup_logging, Timer
 
-from .model import get_fingernet, DEFAULT_WEIGHTS_PATH
+from .wrapper import FingerNetWrapper, get_fingernet, postprocess
+from .fnet_utils import get_fingernet_logger, FnetTimer, DEFAULT_WEIGHTS_PATH
+
+logger = get_fingernet_logger('fingernet.api', level=logging.DEBUG)
 
 torch.set_float32_matmul_precision("medium")
 
@@ -37,9 +38,8 @@ class FingerprintDataset(Dataset):
         try:
             img_pil = Image.open(img_path).convert("L")
 
-            # Safeguard Logic: Check if the image exceeds the maximum dimension limit
             if img_pil.height > self.max_dim or img_pil.width > self.max_dim:
-                warnings.warn(
+                logger.warning(
                     f"Image {os.path.basename(img_path)} with size {img_pil.size} exceeds max_dim of {self.max_dim}. "
                     "Resizing it down."
                 )
@@ -55,42 +55,8 @@ class FingerprintDataset(Dataset):
                 "original_shape": img_np.shape,
             }
         except Exception as e:
-            warnings.warn(f"Could not load image {img_path}. Skipping. Error: {e}")
+            logger.warning(f"Could not load image {img_path}. Skipping. Error: {e}")
             return None
-
-
-def dynamic_padding_collate(batch):
-    """
-    Custom collate_fn that pads images to the max size within a batch.
-    It also filters out None items that may result from loading errors.
-    """
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return None, None, None
-
-    max_h = max(item["image"].shape[1] for item in batch)
-    max_w = max(item["image"].shape[2] for item in batch)
-
-    images, paths, orig_shapes = [], [], []
-    for item in batch:
-        img = item["image"]
-        _, h, w = img.shape
-        padding = (0, max_w - w, 0, max_h - h)  # (left, right, top, bottom)
-        padded_img = torch.nn.functional.pad(img, padding, mode="constant", value=1.0)
-
-        images.append(padded_img)
-        paths.append(item["path"])
-        orig_shapes.append(item["original_shape"])
-
-    batch_tensors = torch.stack(images)
-    batch_paths = paths
-    batch_orig_shapes = (
-        torch.tensor([s[0] for s in orig_shapes]),
-        torch.tensor([s[1] for s in orig_shapes]),
-    )
-
-    return batch_tensors, batch_paths, batch_orig_shapes
-
 
 def find_image_paths(input_path: str, recursive: bool = False) -> list[str]:
     """
@@ -139,6 +105,38 @@ def find_image_paths(input_path: str, recursive: bool = False) -> list[str]:
         raise ValueError(f"No images found in: {input_path}")
 
     return sorted(image_paths)
+
+def dynamic_padding_collate(batch):
+    """
+    Custom collate_fn that pads images to the max size within a batch.
+    It also filters out None items that may result from loading errors.
+    """
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None, None, None
+
+    max_h = max(item["image"].shape[1] for item in batch)
+    max_w = max(item["image"].shape[2] for item in batch)
+
+    images, paths, orig_shapes = [], [], []
+    for item in batch:
+        img = item["image"]
+        _, h, w = img.shape
+        padding = (0, max_w - w, 0, max_h - h)  # (left, right, top, bottom)
+        padded_img = torch.nn.functional.pad(img, padding, mode="constant", value=1.0)
+
+        images.append(padded_img)
+        paths.append(item["path"])
+        orig_shapes.append(item["original_shape"])
+
+    batch_tensors = torch.stack(images)
+    batch_paths = paths
+    batch_orig_shapes = (
+        torch.tensor([s[0] for s in orig_shapes]),
+        torch.tensor([s[1] for s in orig_shapes]),
+    )
+
+    return batch_tensors, batch_paths, batch_orig_shapes
 
 
 def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False):
@@ -191,12 +189,11 @@ def postprocess_and_save_batch(
 ):
     """Executa pós-processamento e salva os resultados de um lote."""
     worker_id = threading.get_ident()
-    logger = logging.getLogger()
 
     logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
-        with Timer() as t_post:
-            final_outputs = post(raw_outputs_cpu, threshold=0.5)
+        with FnetTimer("Post-processing", logger) as t_post:
+            final_outputs = postprocess(raw_outputs_cpu, threshold=0.5)
 
         padded_h, padded_w = padded_shape
 
@@ -226,14 +223,11 @@ def postprocess_and_save_batch(
             "CPU worker finished batch", 
             extra={
                 'cpu_worker_id': worker_id, 
-                'postprocess_duration_ms': t_post.elapsed,
                 'batch_size': len(batch_paths)
             }
         )
     except Exception as e:
         warnings.warn(f"Falha no pós-processamento do lote iniciado com {os.path.basename(batch_paths[0])}. Erro: {e}")
-
-
 
 def create_output_directories(output_path: str):
     """Create output directory structure."""
@@ -274,7 +268,7 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def inference_worker_ddp(
+def inference_worker_ddp_hybrid(
     rank: int,
     world_size: int,
     image_paths: list[str],
@@ -290,20 +284,19 @@ def inference_worker_ddp(
     """
     Worker function for distributed inference on a single GPU.
     """
-    logger = setup_logging(rank=rank)
     try:
         # Setup DDP
         setup_ddp(rank, world_size)
 
         # Only rank 0 prints and creates directories
-        is_main = rank == 0
+        is_main = (rank == 0)
 
         if is_main:
-            print(f"Starting Distributed Inference")
-            print(f"World Size: {world_size} GPUs")
-            print(f"Batch Size per GPU: {batch_size}")
-            print(f"Total Images: {len(image_paths)}")
-            print(f"Output Path: {output_path}")
+            logger.info(f"Starting Distributed Inference")
+            logger.info(f"World Size: {world_size} GPUs")
+            logger.info(f"Batch Size per GPU: {batch_size}")
+            logger.info(f"Total Images: {len(image_paths)}")
+            logger.info(f"Output Path: {output_path}")
 
             # Create output directories
             create_output_directories(output_path)
@@ -313,17 +306,17 @@ def inference_worker_ddp(
 
         # Load model
         if is_main:
-            print(f"[Rank {rank}] Loading model...")
+            logger.info(f"[Rank {rank}] Loading model...")
 
-        model = get_fingernet(
-            weights_path=weights_path, device=f"cuda:{rank}", log=False
+        model: FingerNetWrapper = get_fingernet(
+            weights_path=weights_path, device=f"cuda:{rank}"
         )
         model.eval()
 
         # Optionally compile model
         if compile_model:
             if is_main:
-                print(f"[Rank {rank}] Compiling model with torch.compile...")
+                logger.info(f"[Rank {rank}] Compiling model with torch.compile...")
             model = torch.compile(model)
 
         # Wrap with DDP - not strictly necessary for inference-only but helps with synchronization
@@ -345,11 +338,11 @@ def inference_worker_ddp(
         )
 
         if is_main:
-            print(f"[Rank {rank}] Starting inference...")
+            logger.info(f"[Rank {rank}] Starting inference...")
         
         with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
             futures = []
-            max_queue_size = 3 * num_cpu_workers
+            max_queue_size = 2 * num_cpu_workers
             with torch.no_grad():
                 iterator = tqdm(dataloader, desc=f"GPU {rank}", disable=not is_main)
                 for batch_tensors, batch_paths, batch_orig_shapes in iterator:
@@ -358,20 +351,13 @@ def inference_worker_ddp(
                     _, _, padded_h, padded_w = batch_tensors.shape
                     batch_tensors = batch_tensors.to(f"cuda:{rank}")
                     # ETAPA GPU: Inferência
-                    with Timer() as t_gpu:
-                        raw_outputs = model(batch_tensors)
-                    logger.info(
-                        "GPU inference complete",
-                        extra={'duration_ms': t_gpu.elapsed, 'batch_size': len(batch_paths)}
-                    )
+                    with FnetTimer('GPU Inference', logger) as t_gpu:
+                        raw_outputs = model.time(batch_tensors)
+
 
                     # ETAPA DE TRANSFERÊNCIA: Mover para CPU
-                    with Timer() as t_transfer:
+                    with FnetTimer('GPU->CPU Transfer', logger) as t_transfer:
                         raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
-                    logger.info(
-                        "GPU->CPU transfer complete",
-                        extra={'duration_ms': t_transfer.elapsed}
-                    )
 
                     # ETAPA DE SUBMISSÃO: Enviar para a pool de threads
                     future = executor.submit(
@@ -392,25 +378,147 @@ def inference_worker_ddp(
 
                     if queue_size >= max_queue_size:
                         logger.warning("CPU queue is full. GPU process is waiting.", extra={'queue_size': queue_size})
-                        with Timer() as t_wait:
+                        with FnetTimer('GPU waiting', logger) as t_wait:
                             completed_future = futures.pop(0)
                             completed_future.result()
-                        logger.info("GPU process resumed.", extra={'wait_time_ms': t_wait.elapsed})
+                        logger.info("GPU process resumed.")
 
             # Aguardar a finalização de todas as tarefas submetidas por este rank
             if is_main:
-                print(f"\n[Rank {rank}] Inference complete. Waiting for post-processing...")
+                logger.info(f"[Rank {rank}] Inference complete. Waiting for post-processing...")
             for future in tqdm(futures, desc=f"Finalizing (GPU {rank})", disable=not is_main):
                 future.result()
 
         # Sincronizar todas as GPUs antes de finalizar
         dist.barrier()
         if is_main:
-            print(f"✓ Inference Complete!")
-            print(f"  Results saved to: {output_path}")
+            logger.info(f"✓ Inference Complete!")
+            logger.info(f"  Results saved to: {output_path}")
 
     except Exception as e:
-        print(f"[Rank {rank}] Error: {e}")
+        logger.error(f"[Rank {rank}] Error: {e}")
+        raise
+    finally:
+        # Cleanup
+        cleanup_ddp()
+
+
+def inference_worker_ddp_gpu(
+    rank: int,
+    world_size: int,
+    image_paths: list[str],
+    max_image_dim: int,
+    output_path: str,
+    weights_path: str,
+    batch_size: int,
+    num_workers: int,
+    mnt_degrees: bool,
+    compile_model: bool,
+    num_cpu_workers: int,
+):
+    """
+    Worker function for distributed inference on a single GPU.
+    """
+    try:
+        # Setup DDP
+        setup_ddp(rank, world_size)
+
+        # Only rank 0 prints and creates directories
+        is_main = (rank == 0)
+
+        if is_main:
+            logger.info(f"Starting Distributed Inference")
+            logger.info(f"World Size: {world_size} GPUs")
+            logger.info(f"Batch Size per GPU: {batch_size}")
+            logger.info(f"Total Images: {len(image_paths)}")
+            logger.info(f"Output Path: {output_path}")
+
+            # Create output directories
+            create_output_directories(output_path)
+
+        # Synchronize: all processes wait for rank 0 to create directories
+        dist.barrier()
+
+        # Load model
+        if is_main:
+            logger.info(f"[Rank {rank}] Loading model...")
+
+        model: FingerNetWrapper = get_fingernet(
+            weights_path=weights_path, device=f"cuda:{rank}"
+        )
+        model.eval()
+
+        # Optionally compile model
+        if compile_model:
+            if is_main:
+                logger.info(f"[Rank {rank}] Compiling model with torch.compile...")
+            model = torch.compile(model)
+
+        # Wrap with DDP - not strictly necessary for inference-only but helps with synchronization
+        # model = DDP(model, device_ids=[rank])
+
+        # Setup dataset and distributed sampler
+        dataset = FingerprintDataset(image_paths, max_dim=max_image_dim)
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=(num_workers > 0),
+            collate_fn=dynamic_padding_collate,
+        )
+
+        if is_main:
+            logger.info(f"[Rank {rank}] Starting inference...")
+        
+        all_results = []
+        with torch.no_grad():
+            iterator = tqdm(dataloader, desc=f"GPU {rank}", disable=not is_main)
+            for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                if batch_tensors is None: continue
+
+                _, _, padded_h, padded_w = batch_tensors.shape
+                batch_tensors = batch_tensors.to(f"cuda:{rank}")
+                # ETAPA GPU: Inferência
+                with FnetTimer('GPU Inference', logger) as t_gpu:
+                    results = model(batch_tensors)
+
+
+                # ETAPA DE TRANSFERÊNCIA: Mover para CPU
+                with FnetTimer('GPU->CPU Transfer', logger) as t_transfer:
+                    for i in range(len(batch_paths)):
+                        result_item = {
+                            'input_path': batch_paths[i],
+                            'minutiae': results['minutiae'][i].cpu().numpy(),
+                            'enhanced_image': results['enhanced_image'][i].cpu().numpy(),
+                            'segmentation_mask': results['segmentation_mask'][i].cpu().numpy(),
+                            'orientation_field': results['orientation_field'][i].cpu().numpy(),
+                        }
+                        all_results.append(result_item)
+
+
+        dist.barrier()  # Sincronizar antes de salvar
+
+        for result in tqdm(all_results, desc=f"Saving (GPU {rank})", disable = not is_main):
+            save_results(result, output_path, mnt_degrees)
+
+        # ALL processes must participate in reduce (collective operation)
+        total_processed = torch.tensor(len(all_results), device=f'cuda:{rank}')
+        dist.reduce(total_processed, dst=0, op=dist.ReduceOp.SUM)
+
+        # Sincronizar todas as GPUs antes de finalizar
+        dist.barrier()
+        if is_main:
+            logger.info(f"✓ Inference Complete!")
+            logger.info(f"  Total images processed: {total_processed.item()}")
+            logger.info(f"  Results saved to: {output_path}")
+
+    except Exception as e:
+        logger.error(f"[Rank {rank}] Error: {e}")
         raise
     finally:
         # Cleanup
@@ -432,19 +540,17 @@ def inference_single_gpu(
     """
     Inference on a single GPU (or CPU if device_id is -1).
     """
-    logger = setup_logging(rank=device_id)
-
-    print(f"Starting Single GPU Inference")
-    print(f"Device: cuda:{device_id}")
-    print(f"Batch Size: {batch_size}")
-    print(f"Total Images: {len(image_paths)}")
-    print(f"Output Path: {output_path}")
     device = f"cuda:{device_id}" if torch.cuda.is_available() and device_id != -1 else "cpu"
+
+    logger.info(f"Starting Single GPU Inference")
+    logger.info(f"Device: {device}")
+    logger.info(f"Batch Size: {batch_size}")
+    logger.info(f"Total Images: {len(image_paths)}")
+    logger.info(f"Output Path: {output_path}")
 
     create_output_directories(output_path)
     model = get_fingernet(weights_path=weights_path, device=device, log=False)
     if compile_model:
-        print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
     dataset = FingerprintDataset(image_paths, max_dim=max_image_dim)
@@ -453,7 +559,6 @@ def inference_single_gpu(
         pin_memory=True, shuffle=False, persistent_workers=(num_workers > 0),
         collate_fn=dynamic_padding_collate
     )
-    print("Starting inference...")
 
     with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
         futures = []
@@ -486,13 +591,13 @@ def inference_single_gpu(
                     completed_future = futures.pop(0)
                     completed_future.result()
 
-        print("\nInference complete. Waiting for post-processing and saving to finish...")
+        logger.info("\nInference complete. Waiting for post-processing and saving to finish...")
         for future in tqdm(futures, desc="Finalizing"):
             future.result()  # Aguarda a conclusão e levanta exceções se houver
 
-    print(f"✓ Inference Complete!")
-    print(f"  Total images processed: {len(image_paths)}")
-    print(f"  Results saved to: {output_path}")
+    logger.info(f"✓ Inference Complete!")
+    logger.info(f"  Total images processed: {len(image_paths)}")
+    logger.info(f"  Results saved to: {output_path}")
 
 
 def run_inference(
@@ -546,32 +651,16 @@ def run_inference(
             compile_model=compile_model,
             num_cpu_workers=num_cpu_workers,
         )
-    elif isinstance(gpus, int):
-        world_size = gpus
-        gpu_ids = list(range(world_size))
+    elif isinstance(gpus, int) or isinstance(gpus, list):
+        if isinstance(gpus, int):
+            world_size = gpus
+            gpu_ids = list(range(world_size))
+        else:
+            world_size = len(gpus)
+            gpu_ids = gpus
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
         mp.spawn(
-            inference_worker_ddp,
-            nprocs=world_size,
-            join=True,
-            args=(
-                world_size,
-                image_paths,
-                max_image_dim,
-                output_path,
-                weights_path,
-                batch_size,
-                num_workers,
-                mnt_degrees,
-                compile_model,
-                num_cpu_workers,
-            ),
-        )
-    elif isinstance(gpus, list):
-        world_size = len(gpus)
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-        mp.spawn(
-            inference_worker_ddp,
+            inference_worker_ddp_gpu,
             nprocs=world_size,
             join=True,
             args=(
@@ -589,41 +678,3 @@ def run_inference(
         )
     else:
         raise ValueError(f"Invalid gpus parameter: {gpus}")
-
-
-def run_enhancement(
-    input_path: str,
-    output_path: str,
-    weights_path: str = DEFAULT_WEIGHTS_PATH,
-    gpus: int | list[int] | None = None,
-    batch_size: int = 4,
-    recursive: bool = False,
-):
-    """
-    Run only image enhancement (faster than full inference).
-
-    Note: This is a placeholder. Full implementation would require
-    modifying the worker functions to call model.enhance() instead.
-    """
-    print("Enhancement-only mode not yet implemented.")
-    print("Use run_inference() for now.")
-    raise NotImplementedError("Enhancement-only mode coming soon")
-
-
-def run_segmentation(
-    input_path: str,
-    output_path: str,
-    weights_path: str = DEFAULT_WEIGHTS_PATH,
-    gpus: int | list[int] | None = None,
-    batch_size: int = 4,
-    recursive: bool = False,
-):
-    """
-    Run only segmentation (faster than full inference).
-
-    Note: This is a placeholder. Full implementation would require
-    modifying the worker functions to call model.segment() instead.
-    """
-    print("Segmentation-only mode not yet implemented.")
-    print("Use run_inference() for now.")
-    raise NotImplementedError("Segmentation-only mode coming soon")

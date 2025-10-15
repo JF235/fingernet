@@ -6,15 +6,8 @@ plot) are imported only when their symbols are actually used. This
 prevents slow startup when the CLI entrypoint imports
 ``fingernet.cli`` (which imports the package) just to show help.
 """
-
 from typing import Any
 
-__all__ = [
-    "run_inference",
-    "get_fingernet",
-    "FingerNetWrapper",
-    "plot_output",
-]
 
 class _LazyImport:
     """Proxy that imports the real object on first access/call."""
@@ -42,6 +35,8 @@ class _LazyImport:
 # Expose lazy proxies for public API
 run_inference = _LazyImport("api", "run_inference")
 get_fingernet_core = _LazyImport("model", "get_fingernet_core")
-get_fingernet = _LazyImport("model", "get_fingernet")
+get_fingernet = _LazyImport("wrapper", "get_fingernet")
 FingerNetWrapper = _LazyImport("model", "FingerNetWrapper")
 plot_output = _LazyImport("plot", "plot_output")
+get_fingernet_logger = _LazyImport("fnet_utils", "get_fingernet_logger")
+FnetTimer = _LazyImport("fnet_utils", "FnetTimer")

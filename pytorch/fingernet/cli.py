@@ -52,6 +52,7 @@ def infer_command(args):
     print(f"Recursive:   {args.recursive}")
     print(f"Compile:     {args.compile}")
     print(f"Max Dim:     {args.max_dim}")
+    print(f"Strategy:    {args.strategy}")
     print(f"CPU Workers: {args.cpu_workers}")
     print(f"{'='*70}\n")
     
@@ -66,6 +67,7 @@ def infer_command(args):
         mnt_degrees=args.degrees,
         compile_model=args.compile,
         max_image_dim=args.max_dim,
+        strategy=args.strategy,
         num_cpu_workers=args.cpu_workers,
     )
 
@@ -140,7 +142,8 @@ Examples:
         sp.add_argument('--degrees', action='store_true', help='Save minutiae angles in degrees instead of radians')
         sp.add_argument('--compile', action='store_true', help='Compile model with torch.compile for faster inference (experimental)')
         sp.add_argument('--max-dim', type=int, default=1024, help='Maximum dimension (H or W) for an image before resizing (default: 1024)')
-        sp.add_argument('--cpu-workers', type=int, default=4, help='Número de threads da CPU para pós-processamento (default: 4)')
+        sp.add_argument('--strategy',  type=str, default='full_gpu', choices=['hybrid', 'full_gpu'], help="Execution strategy: 'hybrid' (GPU infer, CPU post-proc) 'full_gpu' (everything on GPU). (default: full_gpu)")
+        sp.add_argument('--cpu-workers', type=int, default=4, help='Number of CPU threads for post-processing in hybrid mode and for saving results (default: 4)')
 
     if any(h in sys.argv for h in ('-h', '--help')) and not any(cmd in sys.argv for cmd in subcommand_names):
         subparsers_temp = parser.add_subparsers(dest='command', required=False, help='Command to execute')

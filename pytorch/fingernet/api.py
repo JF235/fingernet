@@ -236,7 +236,6 @@ def create_output_directories(output_path: str):
     os.makedirs(os.path.join(output_path, "enhanced"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "ori"), exist_ok=True)
 
-
 def setup_ddp(rank: int, world_size: int, timeout_minutes: int = 30):
     """
     Initialize distributed process group.
@@ -261,344 +260,18 @@ def setup_ddp(rank: int, world_size: int, timeout_minutes: int = 30):
         device_id=torch.device(f"cuda:{rank}"),
     )
 
-
 def cleanup_ddp():
     """Cleanup distributed process group."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
-
-def inference_worker_ddp_hybrid(
-    rank: int,
-    world_size: int,
-    image_paths: list[str],
-    max_image_dim: int,
-    output_path: str,
-    weights_path: str,
-    batch_size: int,
-    num_workers: int,
-    mnt_degrees: bool,
-    compile_model: bool,
-    num_cpu_workers: int,
-):
-    """
-    Worker function for distributed inference on a single GPU.
-    """
-    try:
-        # Setup DDP
-        setup_ddp(rank, world_size)
-
-        # Only rank 0 prints and creates directories
-        is_main = (rank == 0)
-
-        if is_main:
-            logger.info(f"Starting Distributed Inference")
-            logger.info(f"World Size: {world_size} GPUs")
-            logger.info(f"Batch Size per GPU: {batch_size}")
-            logger.info(f"Total Images: {len(image_paths)}")
-            logger.info(f"Output Path: {output_path}")
-
-            # Create output directories
-            create_output_directories(output_path)
-
-        # Synchronize: all processes wait for rank 0 to create directories
-        dist.barrier()
-
-        # Load model
-        if is_main:
-            logger.info(f"[Rank {rank}] Loading model...")
-
-        model: FingerNetWrapper = get_fingernet(
-            weights_path=weights_path, device=f"cuda:{rank}"
-        )
-        model.eval()
-
-        # Optionally compile model
-        if compile_model:
-            if is_main:
-                logger.info(f"[Rank {rank}] Compiling model with torch.compile...")
-            model = torch.compile(model)
-
-        # Wrap with DDP - not strictly necessary for inference-only but helps with synchronization
-        # model = DDP(model, device_ids=[rank])
-
-        # Setup dataset and distributed sampler
-        dataset = FingerprintDataset(image_paths, max_dim=max_image_dim)
-        sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            collate_fn=dynamic_padding_collate,
-        )
-
-        if is_main:
-            logger.info(f"[Rank {rank}] Starting inference...")
-        
-        with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
-            futures = []
-            max_queue_size = 2 * num_cpu_workers
-            with torch.no_grad():
-                iterator = tqdm(dataloader, desc=f"GPU {rank}", disable=not is_main)
-                for batch_tensors, batch_paths, batch_orig_shapes in iterator:
-                    if batch_tensors is None: continue
-
-                    _, _, padded_h, padded_w = batch_tensors.shape
-                    batch_tensors = batch_tensors.to(f"cuda:{rank}")
-                    # ETAPA GPU: Inferência
-                    with FnetTimer('GPU Inference', logger) as t_gpu:
-                        raw_outputs = model.time(batch_tensors)
-
-
-                    # ETAPA DE TRANSFERÊNCIA: Mover para CPU
-                    with FnetTimer('GPU->CPU Transfer', logger) as t_transfer:
-                        raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
-
-                    # ETAPA DE SUBMISSÃO: Enviar para a pool de threads
-                    future = executor.submit(
-                        postprocess_and_save_batch,
-                        raw_outputs_cpu,
-                        batch_paths,
-                        batch_orig_shapes,
-                        (padded_h, padded_w),
-                        output_path,
-                        mnt_degrees
-                    )
-                    futures.append(future)
-                    queue_size = len(futures)
-                    logger.info(
-                        "Task submitted to CPU queue",
-                        extra={'queue_size': queue_size, 'first_image': os.path.basename(batch_paths[0])}
-                    )
-
-                    if queue_size >= max_queue_size:
-                        logger.warning("CPU queue is full. GPU process is waiting.", extra={'queue_size': queue_size})
-                        with FnetTimer('GPU waiting', logger) as t_wait:
-                            completed_future = futures.pop(0)
-                            completed_future.result()
-                        logger.info("GPU process resumed.")
-
-            # Aguardar a finalização de todas as tarefas submetidas por este rank
-            if is_main:
-                logger.info(f"[Rank {rank}] Inference complete. Waiting for post-processing...")
-            for future in tqdm(futures, desc=f"Finalizing (GPU {rank})", disable=not is_main):
-                future.result()
-
-        # Sincronizar todas as GPUs antes de finalizar
-        dist.barrier()
-        if is_main:
-            logger.info(f"✓ Inference Complete!")
-            logger.info(f"  Results saved to: {output_path}")
-
-    except Exception as e:
-        logger.error(f"[Rank {rank}] Error: {e}")
-        raise
-    finally:
-        # Cleanup
-        cleanup_ddp()
-
-
-def inference_worker_ddp_gpu(
-    rank: int,
-    world_size: int,
-    image_paths: list[str],
-    max_image_dim: int,
-    output_path: str,
-    weights_path: str,
-    batch_size: int,
-    num_workers: int,
-    mnt_degrees: bool,
-    compile_model: bool,
-    num_cpu_workers: int,
-):
-    """
-    Worker function for distributed inference on a single GPU.
-    """
-    try:
-        # Setup DDP
-        setup_ddp(rank, world_size)
-
-        # Only rank 0 prints and creates directories
-        is_main = (rank == 0)
-
-        if is_main:
-            logger.info(f"Starting Distributed Inference")
-            logger.info(f"World Size: {world_size} GPUs")
-            logger.info(f"Batch Size per GPU: {batch_size}")
-            logger.info(f"Total Images: {len(image_paths)}")
-            logger.info(f"Output Path: {output_path}")
-
-            # Create output directories
-            create_output_directories(output_path)
-
-        # Synchronize: all processes wait for rank 0 to create directories
-        dist.barrier()
-
-        # Load model
-        if is_main:
-            logger.info(f"[Rank {rank}] Loading model...")
-
-        model: FingerNetWrapper = get_fingernet(
-            weights_path=weights_path, device=f"cuda:{rank}"
-        )
-        model.eval()
-
-        # Optionally compile model
-        if compile_model:
-            if is_main:
-                logger.info(f"[Rank {rank}] Compiling model with torch.compile...")
-            model = torch.compile(model)
-
-        # Wrap with DDP - not strictly necessary for inference-only but helps with synchronization
-        # model = DDP(model, device_ids=[rank])
-
-        # Setup dataset and distributed sampler
-        dataset = FingerprintDataset(image_paths, max_dim=max_image_dim)
-        sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            collate_fn=dynamic_padding_collate,
-        )
-
-        if is_main:
-            logger.info(f"[Rank {rank}] Starting inference...")
-        
-        all_results = []
-        with torch.no_grad():
-            iterator = tqdm(dataloader, desc=f"GPU {rank}", disable=not is_main)
-            for batch_tensors, batch_paths, batch_orig_shapes in iterator:
-                if batch_tensors is None: continue
-
-                _, _, padded_h, padded_w = batch_tensors.shape
-                batch_tensors = batch_tensors.to(f"cuda:{rank}")
-                # ETAPA GPU: Inferência
-                with FnetTimer('GPU Inference', logger) as t_gpu:
-                    results = model(batch_tensors)
-
-
-                # ETAPA DE TRANSFERÊNCIA: Mover para CPU
-                with FnetTimer('GPU->CPU Transfer', logger) as t_transfer:
-                    for i in range(len(batch_paths)):
-                        result_item = {
-                            'input_path': batch_paths[i],
-                            'minutiae': results['minutiae'][i].cpu().numpy(),
-                            'enhanced_image': results['enhanced_image'][i].cpu().numpy(),
-                            'segmentation_mask': results['segmentation_mask'][i].cpu().numpy(),
-                            'orientation_field': results['orientation_field'][i].cpu().numpy(),
-                        }
-                        all_results.append(result_item)
-
-
-        dist.barrier()  # Sincronizar antes de salvar
-
-        for result in tqdm(all_results, desc=f"Saving (GPU {rank})", disable = not is_main):
-            save_results(result, output_path, mnt_degrees)
-
-        # ALL processes must participate in reduce (collective operation)
-        total_processed = torch.tensor(len(all_results), device=f'cuda:{rank}')
-        dist.reduce(total_processed, dst=0, op=dist.ReduceOp.SUM)
-
-        # Sincronizar todas as GPUs antes de finalizar
-        dist.barrier()
-        if is_main:
-            logger.info(f"✓ Inference Complete!")
-            logger.info(f"  Total images processed: {total_processed.item()}")
-            logger.info(f"  Results saved to: {output_path}")
-
-    except Exception as e:
-        logger.error(f"[Rank {rank}] Error: {e}")
-        raise
-    finally:
-        # Cleanup
-        cleanup_ddp()
-
-
-def inference_single_gpu(
-    device_id: int,
-    image_paths: list[str],
-    max_image_dim: int,
-    output_path: str,
-    weights_path: str,
-    batch_size: int,
-    num_workers: int,
-    mnt_degrees: bool,
-    compile_model: bool,
-    num_cpu_workers: int,
-):
-    """
-    Inference on a single GPU (or CPU if device_id is -1).
-    """
-    device = f"cuda:{device_id}" if torch.cuda.is_available() and device_id != -1 else "cpu"
-
-    logger.info(f"Starting Single GPU Inference")
-    logger.info(f"Device: {device}")
-    logger.info(f"Batch Size: {batch_size}")
-    logger.info(f"Total Images: {len(image_paths)}")
-    logger.info(f"Output Path: {output_path}")
-
-    create_output_directories(output_path)
-    model = get_fingernet(weights_path=weights_path, device=device, log=False)
-    if compile_model:
-        model = torch.compile(model)
-
-    dataset = FingerprintDataset(image_paths, max_dim=max_image_dim)
-    dataloader = DataLoader(
-        dataset, batch_size=batch_size, num_workers=num_workers,
-        pin_memory=True, shuffle=False, persistent_workers=(num_workers > 0),
-        collate_fn=dynamic_padding_collate
-    )
-
-    with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
-        futures = []
-        max_queue_size = 3 * num_cpu_workers
-        with torch.no_grad():
-            for batch_tensors, batch_paths, batch_orig_shapes in tqdm(dataloader, desc="Processing"):
-                if batch_tensors is None: continue
-
-                # ETAPA GPU: Inferência
-                _, _, padded_h, padded_w = batch_tensors.shape
-                batch_tensors = batch_tensors.to(device)
-                raw_outputs = model(batch_tensors)
-
-                # ETAPA DE TRANSFERÊNCIA: Mover para CPU
-                raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
-
-                # ETAPA DE SUBMISSÃO: Enviar para a pool de threads
-                future = executor.submit(
-                    postprocess_and_save_batch,
-                    raw_outputs_cpu,
-                    batch_paths,
-                    batch_orig_shapes,
-                    (padded_h, padded_w),
-                    output_path,
-                    mnt_degrees
-                )
-                futures.append(future)
-
-                if len(futures) >= max_queue_size:
-                    completed_future = futures.pop(0)
-                    completed_future.result()
-
-        logger.info("\nInference complete. Waiting for post-processing and saving to finish...")
-        for future in tqdm(futures, desc="Finalizing"):
-            future.result()  # Aguarda a conclusão e levanta exceções se houver
-
-    logger.info(f"✓ Inference Complete!")
-    logger.info(f"  Total images processed: {len(image_paths)}")
-    logger.info(f"  Results saved to: {output_path}")
-
+def _ddp_launch_target(rank: int, world_size: int, gpu_ids: list[int], config: dict):
+    """Função alvo para mp.spawn."""
+    # Mapeia o rank do DDP (0, 1, ...) para o ID real da GPU ([2, 3], ...)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    runner = InferenceRunner(config)
+    runner.setup(rank, world_size)
+    runner.run()
 
 def run_inference(
     input_path: str,
@@ -611,7 +284,8 @@ def run_inference(
     mnt_degrees: bool = True,
     compile_model: bool = False,
     max_image_dim: int = 1024,
-    num_cpu_workers: int = 2,
+    strategy: str = 'hybrid',
+    num_cpu_workers: int = 4,
 ):
     """
     Run FingerNet inference on images.
@@ -634,47 +308,273 @@ def run_inference(
     Example:
         >>> run_inference('images/', 'output/', gpus=2, batch_size=8)
     """
-    # Find all images
-    # print("Discovering images...")
     image_paths = find_image_paths(input_path, recursive)
 
-    if gpus is None or gpus == 0 or not torch.cuda.is_available():
-        inference_single_gpu(
-            device_id=-1,
-            image_paths=image_paths,
-            max_image_dim=max_image_dim,
-            output_path=output_path,
-            weights_path=weights_path,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            mnt_degrees=mnt_degrees,
-            compile_model=compile_model,
-            num_cpu_workers=num_cpu_workers,
-        )
-    elif isinstance(gpus, int) or isinstance(gpus, list):
-        if isinstance(gpus, int):
-            world_size = gpus
-            gpu_ids = list(range(world_size))
-        else:
-            world_size = len(gpus)
-            gpu_ids = gpus
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    # Coleta toda a configuração em um único dicionário para facilitar
+    config = locals()
+
+    # Determina o modo de execução
+    use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
+    is_ddp = isinstance(gpus, int) and gpus > 1 or isinstance(gpus, list)
+
+    if use_cpu:
+        logger.info("Starting Inference on CPU")
+        runner = InferenceRunner(config)
+        runner.setup() # rank=-1, world_size=1 (padrão)
+        runner.run()
+
+    elif is_ddp:
+        gpu_ids = list(range(gpus)) if isinstance(gpus, int) else gpus
+        world_size = len(gpu_ids)
+        logger.info(f"Starting Distributed Inference on {world_size} GPUs: {gpu_ids}")
+        
         mp.spawn(
-            inference_worker_ddp_gpu,
+            _ddp_launch_target,
             nprocs=world_size,
-            join=True,
-            args=(
-                world_size,
-                image_paths,
-                max_image_dim,
-                output_path,
-                weights_path,
-                batch_size,
-                num_workers,
-                mnt_degrees,
-                compile_model,
-                num_cpu_workers,
-            ),
+            args=(world_size, gpu_ids, config),
+            join=True
         )
-    else:
-        raise ValueError(f"Invalid gpus parameter: {gpus}")
+    else: # Single GPU
+        gpu_id = 0 if gpus == 1 else gpus[0]
+        logger.info(f"Starting Inference on single GPU: {gpu_id}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # Reutilizamos a mesma lógica do runner de CPU, mas o setup detectará a GPU
+        config['gpus'] = True # Sinaliza para o setup usar cuda
+        runner = InferenceRunner(config)
+        runner.setup()
+        runner.run()
+
+
+def _save_results_chunk(
+    results_chunk: list[dict],
+    output_path: str,
+    mnt_degrees: bool,
+    worker_rank: int = -1
+):
+    """
+    Função alvo para um worker thread. Recebe um bloco de resultados e os salva em disco.
+    """
+    # Usamos uma descrição simples se não for um processo DDP
+    desc = f"Saving (Worker {worker_rank})" if worker_rank >= 0 else "Saving Results"
+    
+    # O worker não deve mostrar uma barra de progresso individual, pois várias podem ser executadas
+    # em paralelo. Apenas iteramos e salvamos.
+    for result_item in results_chunk:
+        try:
+            save_results(result_item, output_path, mnt_degrees)
+        except Exception as e:
+            # Log de erro é importante em threads para não falhar silenciosamente
+            base_name = os.path.basename(result_item.get('input_path', 'unknown_file'))
+            logger.warning(f"Failed to save result for {base_name} in chunk. Error: {e}")
+
+
+class InferenceRunner:
+    def __init__(self, config: dict):
+        """
+        Inicializa o runner com toda a configuração necessária.
+        'config' é um dicionário contendo tudo: image_paths, output_path, batch_size, etc.
+        """
+        self.config = config
+        self.strategy = None
+        self.rank = -1
+        self.world_size = 1
+        self.device = "cpu"
+        self.is_main_process = True
+        self.model = None
+        self.dataloader = None
+
+    def setup(self, rank: int = -1, world_size: int = 1):
+        """
+        Configura o ambiente para este processo específico (worker).
+        Isso inclui DDP, device, modelo e dataloader.
+        """
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main_process = (rank <= 0) # Rank 0 para DDP, -1 para single/cpu
+
+        # 1. Configurar DDP e Device
+        if self.world_size > 1:
+            setup_ddp(self.rank, self.world_size)
+            self.device = f"cuda:{self.rank}"
+        elif self.config['gpus'] and torch.cuda.is_available():
+            self.device = "cuda:0"
+        else:
+            self.device = "cpu"
+
+        if self.is_main_process:
+            logger.info(f"Setting up runner on device: {self.device}")
+            create_output_directories(self.config['output_path'])
+        
+        if self.world_size > 1:
+            dist.barrier() # Garante que as pastas foram criadas
+
+        # 2. Carregar o Modelo
+        self.model = get_fingernet(
+            weights_path=self.config['weights_path'],
+            device=self.device
+        )
+        if self.config['compile_model']:
+            if self.is_main_process: logger.info("Compiling model with torch.compile...")
+            self.model = torch.compile(self.model)
+        
+        # O DDP wrapper não é necessário para inferência, simplifica o código.
+
+        # 3. Preparar Dataset e DataLoader
+        dataset = FingerprintDataset(self.config['image_paths'], max_dim=self.config['max_image_dim'])
+        sampler = None
+        shuffle = False
+        if self.world_size > 1:
+            sampler = DistributedSampler(
+                dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False, drop_last=False
+            )
+        
+        self.dataloader = DataLoader(
+            dataset,
+            batch_size=self.config['batch_size'],
+            sampler=sampler,
+            shuffle=shuffle,
+            num_workers=self.config['num_workers'],
+            pin_memory=True,
+            persistent_workers=(self.config['num_workers'] > 0),
+            collate_fn=dynamic_padding_collate,
+        )
+
+        # 4. Definir a estratégia de execução
+        self.strategy = self.config['strategy']
+
+    def run(self):
+        """Despacha para o método de execução correto baseado na estratégia."""
+        if self.is_main_process:
+            logger.info(f"Executing with strategy: '{self.strategy}'")
+
+        if self.strategy == 'hybrid':
+            self._run_hybrid()
+        elif self.strategy == 'full_gpu':
+            self._run_full_gpu()
+        else:
+            raise ValueError(f"Unknown execution strategy: {self.strategy}")
+
+        if self.world_size > 1:
+            dist.barrier()
+            cleanup_ddp()
+
+        if self.is_main_process:
+            logger.info("✓ Inference Complete!")
+    
+    def _run_hybrid(self):
+        """Executa o pipeline otimizado para throughput (GPU-infer, CPU-postproc)."""
+        # Esta é a lógica que já tínhamos, usando ThreadPoolExecutor.
+        if self.is_main_process:
+            logger.info("Starting inference loop...")
+
+        num_cpu_workers = self.config['num_cpu_workers']
+        
+        with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+            futures = []
+            max_queue_size = 2 * num_cpu_workers
+
+            with torch.no_grad():
+                desc = f"GPU {self.rank}" if self.world_size > 1 else "Processing"
+                iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
+                
+                for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    if batch_tensors is None: continue
+
+                    # --- ETAPA GPU/CPU: INFERÊNCIA ---
+                    _, _, padded_h, padded_w = batch_tensors.shape
+                    batch_tensors = batch_tensors.to(self.device)
+                    raw_outputs = self.model.fingernet(batch_tensors) # Chama o modelo core
+
+                    # --- ETAPA DE TRANSFERÊNCIA (se necessário) ---
+                    raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
+
+                    # --- ETAPA DE SUBMISSÃO PARA CPU WORKERS ---
+                    future = executor.submit(
+                        postprocess_and_save_batch,
+                        raw_outputs_cpu, batch_paths, batch_orig_shapes,
+                        (padded_h, padded_w), self.config['output_path'], self.config['mnt_degrees']
+                    )
+                    futures.append(future)
+
+                    # Gerenciamento da fila para evitar sobrecarga de memória
+                    if len(futures) >= max_queue_size:
+                        futures.pop(0).result() # Espera o mais antigo terminar
+
+            # Aguardar finalização de todas as tarefas
+            if self.is_main_process:
+                logger.info("Inference complete. Finalizing post-processing...")
+            for future in tqdm(futures, desc=f"Finalizing (Worker {self.rank})", disable=not self.is_main_process):
+                future.result()
+
+        
+    def _run_full_gpu(self):
+        """
+        Executa o pipeline otimizado para latência (tudo na GPU) com salvamento assíncrono.
+        """
+        # Use o mesmo número de workers da CPU que a estratégia híbrida para consistência
+        num_save_workers = self.config['num_cpu_workers']
+        
+        # O tamanho do bloco que aciona o salvamento. Ex: 4 (batch_size) * 10 = 40 imagens.
+        # Isso evita despachar tarefas muito pequenas para os workers.
+        chunk_size = self.config['batch_size'] * 10 
+
+        # Pool de workers para salvar os resultados em segundo plano
+        with ThreadPoolExecutor(max_workers=num_save_workers) as save_executor:
+            futures = []
+            chunk_para_salvar = []
+
+            with torch.no_grad():
+                desc = f"GPU {self.rank}" if self.world_size > 1 else "Processing"
+                iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
+                
+                for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    if batch_tensors is None: continue
+
+                    # --- ETAPA GPU: Inferência E Pós-processamento ---
+                    batch_tensors = batch_tensors.to(self.device)
+                    final_outputs = self.model(batch_tensors)
+
+                    # --- ETAPA DE TRANSFERÊNCIA E COLETA (RÁPIDA) ---
+                    for i in range(len(batch_paths)):
+                        orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
+                        result_item = {
+                            'input_path': batch_paths[i],
+                            'minutiae': final_outputs['minutiae'][i].cpu().numpy(),
+                            'enhanced_image': final_outputs['enhanced_image'][i][:orig_h, :orig_w].cpu().numpy(),
+                            'segmentation_mask': final_outputs['segmentation_mask'][i][:orig_h, :orig_w].cpu().numpy(),
+                            'orientation_field': final_outputs['orientation_field'][i][:orig_h, :orig_w].cpu().numpy(),
+                        }
+                        chunk_para_salvar.append(result_item)
+
+                    # --- ETAPA DE DESPACHO PARA WORKERS ---
+                    if len(chunk_para_salvar) >= chunk_size:
+                        future = save_executor.submit(
+                            _save_results_chunk,
+                            chunk_para_salvar,
+                            self.config['output_path'],
+                            self.config['mnt_degrees'],
+                            self.rank
+                        )
+                        futures.append(future)
+                        chunk_para_salvar = []  # Limpa o bloco para o próximo ciclo
+
+            # --- FINALIZAÇÃO ---
+            # Despacha o último bloco, que pode ser menor que o chunk_size
+            if chunk_para_salvar:
+                future = save_executor.submit(
+                    _save_results_chunk,
+                    chunk_para_salvar,
+                    self.config['output_path'],
+                    self.config['mnt_degrees'],
+                    self.rank
+                )
+                futures.append(future)
+
+            # Aguarda todos os workers de salvamento terminarem seu trabalho
+            if self.is_main_process:
+                logger.info("Inference complete. Waiting for save workers to finish...")
+            
+            # Usamos uma barra de progresso para esperar os futuros, dando feedback ao usuário
+            for future in tqdm(futures, desc=f"Finalizing Save (Worker {self.rank})", disable=not self.is_main_process):
+                future.result() # .result() espera a conclusão e levanta exceções se houver
+

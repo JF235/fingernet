@@ -5,6 +5,7 @@ from .model import FingerNet
 from .fnet_utils import get_fingernet_logger, FnetTimer, logging, DEFAULT_WEIGHTS_PATH, DEFAULT_DEVICE
 import kornia
 import os
+import numpy as np
 
 logger = get_fingernet_logger(__name__, level=logging.INFO)
 
@@ -36,6 +37,19 @@ class FingerNetWrapper(nn.Module):
             post_x = self.postprocess_time(raw_outputs, minutiae_threshold)
 
         return post_x
+
+    def prepare_input(self, x: np.ndarray) -> torch.Tensor:
+        """Converts a numpy image to a torch tensor suitable for the model."""
+        # Check if input is 2D (H, W)
+        if x.ndim == 2:
+            x = np.expand_dims(x, axis=0)  # add batch dimension
+            x = np.expand_dims(x, axis=0)  # add channel dimension
+            tensor_x = torch.tensor(x, dtype=torch.float32)
+        
+        # Detect device
+        device = next(self.fingernet.parameters()).device
+        tensor_x = tensor_x.to(device)
+        return tensor_x
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         _, _, h, w = x.shape

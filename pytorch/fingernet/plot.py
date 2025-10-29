@@ -57,6 +57,50 @@ def plot_mnt(ax: plt.Axes, minutiae: np.ndarray, r: int = 10):
     for x, y, angle, score in minutiae:
         ax.plot([x, x + r * np.cos(angle)], [y, y + r * np.sin(angle)], 'r-', linewidth=1.5)
 
+def plot_raw_output(
+        output: dict,
+        orig_img: np.ndarray | None = None,
+        figsize: tuple = (20, 6),
+        stride: int = 16
+):
+    orientation_field = output['orientation_field'].squeeze()
+    enhanced_image = output['enhanced_image'].squeeze()
+    minutiae = output['minutiae']
+
+    if orig_img is None:
+        input_image = enhanced_image
+    else:
+        input_image = orig_img
+
+    # Cria a figura e a grade de subplots 1x4
+    fig, axes = plt.subplots(1, 4, figsize=figsize)
+    
+    # --- Subplot 1 (Primeira Coluna) ---
+    ax1 = axes[0]
+    plot_img(ax1, orientation_field)
+    ax1.set_title("Campo de Orientação")
+
+    # --- Subplot 2 (Segunda Coluna) ---
+    ax2 = axes[1]
+    plot_img(ax2, enhanced_image)
+    ax2.set_title("Imagem Melhorada")
+
+    # --- Subplot 3 (Terceira Coluna) ---
+    ax3 = axes[2]
+    plot_img(ax3, input_image)
+    plot_ori_field(ax3, orientation_field, stride=stride)
+    ax3.set_title(f"Campo de Orientação (Stride: {stride})")
+    
+    # --- Subplot 4 (Quarta Coluna) ---
+    ax4 = axes[3]
+    plot_img(ax4, input_image)
+    plot_mnt(ax4, minutiae)
+    ax4.set_title(f"Minúcias Detectadas ({len(minutiae)})")
+
+    # Ajusta o layout para evitar sobreposição de títulos
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Ajusta para o suptitle 
+    
+
 def plot_output(
     result: dict,
     save_path: str | None = None,

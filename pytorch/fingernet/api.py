@@ -268,7 +268,9 @@ def cleanup_ddp():
 def _ddp_launch_target(rank: int, world_size: int, gpu_ids: list[int], config: dict):
     """Função alvo para mp.spawn."""
     # Mapeia o rank do DDP (0, 1, ...) para o ID real da GPU ([2, 3], ...)
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    gpu_id = gpu_ids[rank]
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    
     runner = InferenceRunner(config)
     runner.setup(rank, world_size)
     runner.run()

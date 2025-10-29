@@ -42,9 +42,19 @@ class FingerNetWrapper(nn.Module):
         """Converts a numpy image to a torch tensor suitable for the model."""
         # Check if input is 2D (H, W)
         if x.ndim == 2:
-            x = np.expand_dims(x, axis=0)  # add batch dimension
             x = np.expand_dims(x, axis=0)  # add channel dimension
+            x = np.expand_dims(x, axis=0)  # add batch dimension
+        if x.ndim == 3:
+            # This could be (C, H, W) or (B, H, W).
+            # We assume (B, H, W) if B > 1
+            if x.shape[0] > 1:
+                x = np.expand_dims(x, axis=1)  # add channel dimension
+            else:
+                x = np.expand_dims(x, axis=0)  # add batch dimension
+        if x.ndim == 4:
             tensor_x = torch.tensor(x, dtype=torch.float32)
+        else:
+            raise ValueError("Input numpy array must be 2D, 3D - with Channel, or 4D - with Batch.")
         
         # Detect device
         device = next(self.fingernet.parameters()).device

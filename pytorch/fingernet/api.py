@@ -236,20 +236,22 @@ def create_output_directories(output_path: str):
     os.makedirs(os.path.join(output_path, "enhanced"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "ori"), exist_ok=True)
 
-def setup_ddp(rank: int, world_size: int, timeout_minutes: int = 30):
+def setup_ddp(rank: int, world_size: int, gpu_id: int, timeout_minutes: int = 30):
     """
     Initialize distributed process group.
 
     Args:
-        rank: Unique identifier for this process
+        rank: Unique identifier for this process (0, 1, ...)
         world_size: Total number of processes
+        gpu_id: Physical GPU ID to use for this process
         timeout_minutes: Timeout for DDP operations
     """
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
 
     # Set device for this process BEFORE init_process_group
-    torch.cuda.set_device(rank)
+    # Use the actual GPU ID, not the rank
+    torch.cuda.set_device(gpu_id)
 
     # Initialize process group with proper timeout and device_id
     dist.init_process_group(
@@ -257,7 +259,7 @@ def setup_ddp(rank: int, world_size: int, timeout_minutes: int = 30):
         rank=rank,
         world_size=world_size,
         timeout=timedelta(minutes=timeout_minutes),
-        device_id=torch.device(f"cuda:{rank}"),
+        device_id=torch.device(f"cuda:{gpu_id}"),
     )
 
 def cleanup_ddp():
@@ -269,10 +271,10 @@ def _ddp_launch_target(rank: int, world_size: int, gpu_ids: list[int], config: d
     """Função alvo para mp.spawn."""
     # Mapeia o rank do DDP (0, 1, ...) para o ID real da GPU ([2, 3], ...)
     gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
+    # Passa o gpu_id real para o runner usar no setup
     runner = InferenceRunner(config)
-    runner.setup(rank, world_size)
+    runner.setup(rank, world_size, gpu_id)
     runner.run()
 
 def run_inference(
@@ -339,11 +341,13 @@ def run_inference(
     else: # Single GPU
         gpu_id = 0 if gpus == 1 else gpus[0]
         logger.info(f"Starting Inference on single GPU: {gpu_id}")
+        
+        # Para single GPU, definir CUDA_VISIBLE_DEVICES simplifica
+        # e o setup usará cuda:0 (que é a GPU física gpu_id)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        # Reutilizamos a mesma lógica do runner de CPU, mas o setup detectará a GPU
         config['gpus'] = True # Sinaliza para o setup usar cuda
         runner = InferenceRunner(config)
-        runner.setup()
+        runner.setup()  # Usa cuda:0 após CUDA_VISIBLE_DEVICES
         runner.run()
 
 
@@ -385,10 +389,15 @@ class InferenceRunner:
         self.model = None
         self.dataloader = None
 
-    def setup(self, rank: int = -1, world_size: int = 1):
+    def setup(self, rank: int = -1, world_size: int = 1, gpu_id: int = 0):
         """
         Configura o ambiente para este processo específico (worker).
         Isso inclui DDP, device, modelo e dataloader.
+        
+        Args:
+            rank: Rank do processo no DDP (-1 para single process)
+            world_size: Número total de processos
+            gpu_id: ID físico da GPU a usar (para DDP)
         """
         self.rank = rank
         self.world_size = world_size
@@ -396,8 +405,9 @@ class InferenceRunner:
 
         # 1. Configurar DDP e Device
         if self.world_size > 1:
-            setup_ddp(self.rank, self.world_size)
-            self.device = f"cuda:{self.rank}"
+            setup_ddp(self.rank, self.world_size, gpu_id)
+            # Usa o GPU ID físico correto
+            self.device = f"cuda:{gpu_id}"
         elif self.config['gpus'] and torch.cuda.is_available():
             self.device = "cuda:0"
         else:

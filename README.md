@@ -1,144 +1,400 @@
-# *FingerNet* : An Universal Deep Convolutional Network for Extracting Fingerprint Representation
+# FingerNet: Unified Deep Network for Fingerprint Minutiae Extraction
 
-By Yao Tang, Fei Gao, JuFu Feng and YuHang Liu at Peking University
+## Introduction
 
-### Introduction
+**FingerNet** is a deep convolutional neural network designed for fingerprint minutiae extraction that successfully combines traditional fingerprint processing domain knowledge with the advanced representation capabilities of deep learning.
 
-**FingerNet** is an universal deep ConvNet for extracting fingerprint representations including orientation field, segmentation, enhenced fingerprint and minutiae. It can produce reliable results on both rolled/slap and latent fingerprints.
+The original paper addresses a critical challenge in fingerprint analysis: while traditional methods using handcrafted features perform well on clean (rolled/slap) fingerprints, they often fail on latent (crime scene) fingerprints due to complex background noise and fuzzy ridges. Conversely, standard deep learning approaches typically fail to incorporate the specialized domain knowledge already established in fingerprint analysis.
 
-Here is a Python implementation of FingerNet. This code has been tested on Ubuntu 14.04 and Python2.7.
+The key innovation of FingerNet lies in its two-fold approach:
 
-### License
+1. **Transform Traditional Methods into a Network**: The typical fingerprint analysis pipeline (orientation estimation, segmentation, Gabor enhancement, and minutiae extraction) is mathematically transformed into a shallow neural network with fixed weights.
 
-FingerNet is released under the MIT License (refer to the LICENSE file for details).
+2. **Expand and Train the Network**: This shallow network is then expanded by adding more convolutional layers to enhance its representative power, and critically, the weights are released, making the entire network trainable end-to-end.
 
-### Citing FingerNet
+This design allows FingerNet to learn how to handle complex background noise from data while still being guided by a structure inspired by proven, traditional fingerprint processing steps. The resulting unified network can simultaneously output the orientation field, segmentation map, enhanced fingerprint, and minutiae maps, demonstrating superior performance over state-of-the-art methods on both latent and slap fingerprint databases.
 
-If you find FingerNet useful in your research, please consider citing:
+## About This Implementation
 
-    @inproceedings{tang2017FingerNet,
-        Author = {Tang, Yao and Gao, Fei and Feng, Jufu and Liu, Yuhang},
-        Title = {FingerNet: An Unified Deep Network for Fingerprint Minutiae Extraction},
-        booktitle = {Biometrics (IJCB), 2017 IEEE International Joint Conference on},
-        Year = {2017}
-        organization={IEEE}
-    }
+This repository contains an **extended PyTorch implementation** of FingerNet. The original implementation was developed in Python 2.7 with TensorFlow. This version has been completely rewritten for **Python 3.10+** using **PyTorch**, featuring:
 
-### Main Results
-| training data | test data | precision| recall | conv-time/img| post-time/img|
-|:-------------:|:---------:|:--------:|:------:|:------------:|:------------:|
-|  CISL24218    |  FVC2004  |   76%    |  80%   |  674ms       |   285ms      |
-|  CISL24218    |  NISTSD27 |   63%    |  63%   |  183ms       |   885ms      |
+- **Modern PyTorch architecture** with optimized inference pipelines
+- **Multi-GPU distributed inference** using PyTorch DDP (DistributedDataParallel)
+- **Scalable batch processing** for large-scale fingerprint extraction
+- **Flexible API** for both programmatic use and command-line interface
+- **Optimized performance** with torch.compile and memory-efficient processing strategies
 
-**Note**: 
-0. conv-time/img can be faster if using batch size greater than 1.
-0. post-time/img contains orientation selection, segmentation dilation and minutiae nms.
-0. CISL24218 is a in-house database which is unavailable to public. It contains around 8000 matched roll and latent fingerprints with manual minutiae and around 10000 latent fingerprints with only manual minutiae. Both FVC2002DB2A and NISTSD27 are non-intersect with CISL24218. 
+This implementation is designed for production-scale fingerprint analysis, enabling efficient processing of large datasets across multiple GPUs.
 
-### Contents
-0. [Requirements: software](#requirements-software)
-0. [Requirements: hardware](#requirements-hardware)
-0. [Predicting Demo](#predicting-demo)
-0. [Preparation for Training & Testing](#preparation-for-training-and-testing)
-0. [Training](#training)
-0. [Testing](#testing)
-0. [Acknowledgement](#acknowledgement)
+## Running the Original TensorFlow Implementation
 
-
-### Requirements: software
-
-0. `Python 2.7`: cv2, numpy, scipy, matplotlib, pydot, graphviz
-0. `Tensorflow 1.0.1`
-0.  `Keras 2.0.2`
-
-### Requirements: hardware
-
-GPU: Titan, Titan Black, Titan X, K20, K40, K80.
-
-0. FingerNet predicting
-    - 2GB GPU memory for FVC2002DB2A
-    - 5GB GPU memory for NISTSD27
-
-### Predicting Demo
-
-0.  Run `cd` in shell to directory `src/`
-0.  Run `python train_test_deploy.py 0 deploy` to test demo images provided in `datasets/`.
-    - You may use different GPU by changing 0 to desired GPU ID. 
-    - You will see the timing information as below. We get the following running time on single-core of K80 the demo images:
-    ```Shell
-    Predicting images:
-    images 1 / 1: B101L9U
-    load+conv: 4.872s, seg-postpro+nms: 0.223, draw: 2.249
-    Average: load+conv: 4.872s, oir-select+seg-post+nms: 0.223, draw: 2.249
-    Predicting CISL24218:
-    CISL24218 1 / 1: A0100003009991600022036_2
-    load+conv: 2.219s, seg-postpro+nms: 0.439, draw: 2.247
-    Average: load+conv: 2.219s, oir-select+seg-post+nms: 0.439, draw: 2.247
-    Predicting FVC2002DB2A:
-    FVC2002DB2A 1 / 1: 1_1
-    load+conv: 1.718s, seg-postpro+nms: 0.548, draw: 3.309
-    Average: load+conv: 1.718s, oir-select+seg-post+nms: 0.548, draw: 3.309
-    Predicting NIST4:
-    NIST4 1 / 1: F0001_01
-    load+conv: 1.006s, seg-postpro+nms: 1.640, draw: 3.947
-    Average: load+conv: 1.006s, oir-select+seg-post+nms: 1.640, draw: 3.947
-    Predicting NIST14:
-    NIST14 1 / 1: F0000001
-    load+conv: 6.211s, seg-postpro+nms: 3.271, draw: 4.643
-    Average: load+conv: 6.211s, oir-select+seg-post+nms: 3.271, draw: 4.643
-    ```
-    - The visual results might be different from those in the paper due to numerical variations.    
-0. Change `deploy_set=['*/',..., '*/']` in line 44-45 in `train_test_deploy.py` to desired dataset folders to test other fingerprint datasets.
-
-### Preparation for Training and Testing
-
-0.  Move raw fingerprint training images to `datasets/dataset-name/images/`
-    - Training images should be of `bmp` format
-0.  Move segmentation labels to `datasets/dataset-name/seg_labels/`
-    - Segmentation labels should be of `png` format and have the same size and name with its corresponding fingerprint images.
-    - `255` indicates foreground while `0` for background.
-0. Move orientation labels to `datasets/dataset-name/ori_labels/`
-    - Orientation labels are rolled/slap fingerprint aligned to training images and of same size, same name and `bmp` format.
-0. Move minutiae labels to `datasets/dataset-name/mnt_labels/`
-    - Minutiae labels should be of same name and `mnt` format.
-    - `.mnt` structure is as follow:
-        - line 1: image-name
-        - line 2: number-of-minutiae-N, image-W, image-H
-        - next N lines: minutia-x, minutia-y, minutiae-o 
-0. Change `train_set=['*/', ...'*/']` in line 42 in `train_test_deploy.py` to `train_set=['../datasets/dataset-name/',]`
-
-### Training:
-
-0. Run `python train_test_deploy.py 0 train` to finetune your model. 
-    - **Note**: Maximum epoch is set to 100. Early stop if model have converged.
-
-### Testing
-
-0. Run `python train_test_deploy.py 0 test` to test your model.
-    - Different from Predicting, Testing requires datasets to have at least mnt labels and segmentation labels. 
-    - Change `test_set=['*/', ...'*/']` in line 44 in `train_test_deploy.py` to test other datasets.
-
-### Pytorch Implementation
-
-To compare, use the Docker image available via the Dockerfile at the root of the repository.
+If you want to run the **original TensorFlow/Python 2.7 implementation** for comparison or legacy purposes, a Docker image is provided.
 
 ```bash
-# First, check if the image is already available
+# Check if the image already exists
 docker image ls -a
 
-# Build if it does not exist
+# Build the image if it doesn't exist
 docker build -t fingernet:legacy .
-``` 
+```
+
+CPU-only Mode
 
 ```bash
 docker run -it --rm -v "$PWD":/workspace/FingerNet fingernet:legacy
-
-# If you need GPU support, add `--gpus all` before `-it`
 ```
+
+With GPU Support
 
 ```bash
-# Once inside the container
+docker run -it --rm --gpus all -v "$PWD":/workspace/FingerNet fingernet:legacy
+```
+
+Once inside the container:
+
+```bash
+# Navigate to the source directory
 cd src
-# <GPU> <mode=train/test/deploy>
+
+# Run the demo on provided test images
+# Syntax: python train_test_deploy.py <GPU_ID> <mode>
+# GPU_ID: 0, 1, 2, ... (use 0 for CPU mode)
+# mode: train, test, or deploy
 python train_test_deploy.py 0 deploy
 ```
+
+The demo will process sample images from the `datasets/` directory and output results to `datasets/output/`.
+
+**Note**: The original implementation does not support multi-GPU distributed processing.
+
+## Installation (PyTorch Version)
+
+### Basic Installation
+
+```bash
+cd pytorch
+pip install .
+```
+
+### Development Installation (Editable Mode)
+
+For development with full IDE support (PyLance/VSCode):
+
+```bash
+cd pytorch
+pip install -e . --config-settings editable_mode=strict
+```
+
+This ensures proper type checking and autocompletion in your IDE.
+
+## Usage
+
+### Batch Inference
+
+```python
+from fingernet.api import run_inference
+
+# Process a single directory of images
+run_inference(
+    input_path='./images',
+    output_path='./output',
+    gpus=1,  # Use single GPU
+    batch_size=8
+)
+```
+
+Multi-GPU Distributed Inference
+
+```python
+from fingernet.api import run_inference
+
+# Use 2 GPUs (GPU 0 and GPU 1)
+run_inference(
+    input_path='./images',
+    output_path='./output',
+    gpus=2,  # Use first 2 GPUs
+    batch_size=16,  # Batch size per GPU
+    num_workers=4,  # DataLoader workers per GPU
+    compile_model=True,  # Use torch.compile for speedup
+    recursive=True  # Search subdirectories
+)
+
+# Or specify specific GPU IDs
+run_inference(
+    input_path='./images',
+    output_path='./output',
+    gpus=[2, 3],  # Use GPU 2 and GPU 3 specifically
+    batch_size=16,
+    compile_model=True
+)
+```
+
+Advanced Configuration
+
+```python
+from fingernet.api import run_inference
+
+run_inference(
+    input_path='./images',
+    output_path='./output',
+    weights_path='./models/custom_weights.pth',  # Custom model weights
+    gpus=[0, 1, 2, 3],  # Use 4 specific GPUs
+    batch_size=32,  # Large batch per GPU
+    num_workers=8,  # More workers for faster data loading
+    recursive=True,  # Search all subdirectories
+    mnt_degrees=True,  # Output minutiae angles in degrees (not radians)
+    compile_model=True,  # Enable torch.compile optimization
+    max_image_dim=1000,  # Resize large images
+    strategy='full_gpu',  # Processing strategy
+    num_cpu_workers=4  # CPU workers for saving results
+)
+```
+
+### Low-Level API: Direct Model Usage
+
+For more control over the inference pipeline, you can use the model directly:
+
+```python
+from fingernet.wrapper import get_fingernet
+import numpy as np
+from PIL import Image
+
+# Load the model
+model = get_fingernet(
+    weights_path='./models/released_version/Model.pth',
+    device='cuda:0'  # or 'cpu'
+)
+
+# Model is ready for inference
+# model.eval() is already called internally
+```
+
+Processing WSQ Fingerprint Images
+
+```python
+import wsq
+from PIL import Image
+import numpy as np
+from fingernet.wrapper import get_fingernet
+
+# Load WSQ image using the wsq library
+# WSQ files can be opened directly with PIL after importing wsq
+import wsq
+img = Image.open('fingerprint.wsq')
+
+# Convert to numpy array (grayscale)
+img_array = np.array(img, dtype=np.float32)
+
+# Load model
+model = get_fingernet(device='cuda:0')
+
+# Prepare input: convert numpy array to torch tensor
+# prepare_input handles shape conversions automatically
+input_tensor = model.prepare_input(img_array)
+
+# Run inference
+outputs = model(input_tensor, minutiae_threshold=0.5)
+
+# Access results
+minutiae = outputs['minutiae']  # (N, 4) tensor: x, y, angle, quality
+enhanced = outputs['enhanced_image']  # Enhanced fingerprint
+mask = outputs['segmentation_mask']  # Foreground mask
+orientation = outputs['orientation_field']  # Orientation field
+```
+
+Processing Standard Image Formats
+
+```python
+from PIL import Image
+import numpy as np
+from fingernet.wrapper import get_fingernet
+
+# Load standard image formats (PNG, JPG, BMP, etc.)
+img = Image.open('fingerprint.png').convert('L')  # Convert to grayscale
+img_array = np.array(img, dtype=np.float32)
+
+# Load model
+model = get_fingernet(device='cuda:0')
+
+# Prepare and process
+input_tensor = model.prepare_input(img_array)
+outputs = model(input_tensor, minutiae_threshold=0.5)
+
+# Extract minutiae as numpy array
+minutiae_np = outputs['minutiae'].cpu().numpy()
+print(f"Found {len(minutiae_np)} minutiae")
+
+# Each minutia: [x, y, orientation_radians, quality_score]
+for x, y, angle, quality in minutiae_np:
+    print(f"Position: ({x:.1f}, {y:.1f}), Angle: {np.rad2deg(angle):.1f}°, Quality: {quality:.3f}")
+```
+
+Batch Processing with Direct Model Access
+
+```python
+import numpy as np
+from fingernet.wrapper import get_fingernet
+from PIL import Image
+
+# Load multiple images
+image_paths = ['img1.png', 'img2.png', 'img3.png']
+images = [np.array(Image.open(p).convert('L'), dtype=np.float32) for p in image_paths]
+
+# Stack into batch (all images must have same dimensions)
+batch = np.stack(images)  # Shape: (B, H, W)
+
+# Load model
+model = get_fingernet(device='cuda:0')
+
+# Process batch
+input_tensor = model.prepare_input(batch)
+outputs = model(input_tensor)
+
+# outputs['minutiae'] will be a list of tensors, one per image
+for i, mnt in enumerate(outputs['minutiae']):
+    print(f"Image {i}: {len(mnt)} minutiae detected")
+```
+
+## Command-Line Interface (CLI)
+
+Basic Usage
+
+```bash
+fingernet infer ./images/ ./output/
+```
+
+Single GPU Inference
+
+```bash
+fingernet infer --gpus 1 --batch-size 8 ./images/ ./output/
+```
+
+Multi-GPU Inference
+
+```bash
+# Use first 2 GPUs (GPU 0 and 1)
+fingernet infer --gpus 2 --batch-size 16 --compile ./images/ ./output/
+
+# Use specific GPUs (e.g., GPU 2 and 3)
+fingernet infer --gpus "[2, 3]" --batch-size 16 --compile ./images/ ./output/
+```
+
+Advanced Options
+
+```bash
+fingernet infer \
+    --gpus "[0, 1, 2, 3]" \
+    --batch-size 32 \
+    --cores 8 \
+    --compile \
+    --recursive \
+    --degrees \
+    --max-dim 1000 \
+    --strategy full_gpu \
+    --cpu-workers 4 \
+    ./images/ \
+    ./output/
+```
+
+CLI Options Reference
+
+- `--gpus`: GPU configuration
+  - `0` or `none`: Use CPU
+  - `1`: Single GPU (GPU 0)
+  - `N` (N>1): Use N GPUs (0, 1, ..., N-1)
+  - `"[i, j, k]"`: Use specific GPU IDs (must be quoted)
+- `--batch-size` / `-b`: Batch size per GPU (default: 8)
+- `--cores`: DataLoader worker threads per GPU (default: 4)
+- `--compile`: Enable torch.compile for faster inference
+- `--recursive`: Search input directory recursively
+- `--degrees`: Output minutiae angles in degrees instead of radians
+- `--max-dim`: Maximum image dimension (resize if larger)
+- `--strategy`: Processing strategy (`full_gpu`, `cpu_heavy`, etc.)
+- `--cpu-workers`: Number of CPU threads for saving results (default: 4)
+- `--weights`: Custom model weights path
+
+Visualization
+
+After inference, visualize results:
+
+```bash
+fingernet plot ./output/ image_name.png --save ./visualization.png
+```
+
+## Output Format
+
+FingerNet generates organized outputs in four separate directories:
+
+### File Structure
+
+```
+output/
+├── minutiae/
+│   ├── image1.txt
+│   ├── image2.txt
+│   └── ...
+├── enhanced/
+│   ├── image1.png
+│   ├── image2.png
+│   └── ...
+├── mask/
+│   ├── image1.png
+│   ├── image2.png
+│   └── ...
+└── ori/
+    ├── image1.png
+    ├── image2.png
+    └── ...
+```
+
+### Output Descriptions
+
+#### Minutiae Files (`minutiae/*.txt`)
+
+CSV format with header, each line represents one minutia point:
+```
+x, y, angle, score
+123, 456, 1.234567, 0.876543
+```
+- `x, y`: Pixel coordinates of the minutia
+- `angle`: Orientation in radians (or degrees if `--degrees` flag is used). The angle is measured clockwise from the horizontal axis.
+- `score`: Quality/confidence score [0-1]
+
+#### Enhanced Images (`enhanced/*.png`)
+
+Gabor-enhanced fingerprint images with improved ridge-valley contrast. Useful for visualization and further processing.
+
+#### Segmentation Masks (`mask/*.png`)
+
+Binary masks indicating foreground (fingerprint region) vs background. White pixels (255) represent valid fingerprint area, black pixels (0) represent background.
+
+#### Orientation Fields (`ori/*.png`)
+
+Ridge orientation at each pixel, encoded as grayscale images. The orientation angle (in degrees) is shifted by +90° and stored as uint8 values for visualization.
+
+## Citation
+
+If you use FingerNet in your research, please cite the original paper:
+
+```bibtex
+@inproceedings{tang2017fingernet,
+  title={FingerNet: An unified deep network for fingerprint minutiae extraction},
+  author={Tang, Yao and Gao, Fei and Feng, Jufu and Liu, Yuhang},
+  booktitle={2017 IEEE International Joint Conference on Biometrics (IJCB)},
+  pages={108--116},
+  year={2017},
+  organization={IEEE}
+}
+```
+
+## Credits
+
+**Original Authors**: Yao Tang, Fei Gao, Jufu Feng, Yuhang Liu
+
+**PyTorch Implementation & Extensions**: João Contreras (joao.contreras@griaule.com)
+
+This extended implementation includes significant enhancements for production-scale deployment, including multi-GPU distributed inference, optimized batch processing, and a comprehensive API for integration into larger systems.
+
+## License
+
+Please refer to the original FingerNet repository for licensing information regarding the model architecture and weights.

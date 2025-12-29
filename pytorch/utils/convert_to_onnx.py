@@ -61,15 +61,53 @@ class FingerNetSegmentationEnhancement(nn.Module):
         }
 
 
+class FingerNetNativeResolution(nn.Module):
+    """
+    Versão do FingerNet que retorna:
+    - Segmentação nativa (1/8): (batch, 1, H/8, W/8)
+    - Campo de orientação nativo (1/8): (batch, 90, H/8, W/8)
+    - Imagem melhorada (full res): (batch, 1, H, W)
+    
+    O Enhancement Module é aplicado (para gerar a imagem melhorada),
+    mas as máscaras de segmentação e orientação permanecem em resolução 1/8.
+    
+    Ideal para aplicações que precisam da imagem melhorada mas querem
+    economizar memória/latência nas máscaras de segmentação e orientação.
+    """
+    def __init__(self, fingernet_full: FingerNet):
+        super().__init__()
+        self.img_norm = fingernet_full.img_norm
+        self.feature_extractor = fingernet_full.feature_extractor
+        self.ori_seg_head = fingernet_full.ori_seg_head
+        self.enhancement_module = fingernet_full.enhancement_module
+
+    def forward(self, x: torch.Tensor):
+        # Pipeline até enhancement
+        x_norm = self.img_norm(x)
+        features = self.feature_extractor(x_norm)
+        ori_map, seg_map = self.ori_seg_head(features)
+        
+        # Enhancement gera imagem melhorada em resolução completa
+        enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
+        
+        # Retorna: seg e ori em 1/8, enhanced em resolução completa
+        return {
+            'segmentation_native': seg_map,
+            'orientation_native': ori_map,
+            'enhanced_image': enh_real
+        }
+
+
 class FingerNetONNXWrapper(nn.Module):
     """
     Wrapper para exportação ONNX que retorna tensores em vez de dicionário.
     ONNX não suporta dicionários como saída, então retornamos múltiplos tensores.
     """
-    def __init__(self, model, include_minutiae=True):
+    def __init__(self, model, include_minutiae=True, native_resolution=False):
         super().__init__()
         self.model = model
         self.include_minutiae = include_minutiae
+        self.native_resolution = native_resolution
 
     def forward(self, x: torch.Tensor):
         if self.include_minutiae:
@@ -84,6 +122,14 @@ class FingerNetONNXWrapper(nn.Module):
                 out['minutiae_y_offset'],
                 out['minutiae_score']
             )
+        elif self.native_resolution:
+            # Modelo em resolução nativa (1/8) retorna seg + ori nativos + enhanced
+            out = self.model(x)
+            return (
+                out['segmentation_native'],
+                out['orientation_native'],
+                out['enhanced_image']
+            )
         else:
             # Modelo sem minúcias retorna apenas seg + enh + ori
             out = self.model(x)
@@ -95,7 +141,8 @@ class FingerNetONNXWrapper(nn.Module):
 
 
 def convert_to_onnx(weights_path: str, output_path: str, include_minutiae: bool = True, 
-                    input_shape: tuple = (1, 1, 400, 400), opset_version: int = 17):
+                    native_resolution: bool = False, input_shape: tuple = (1, 1, 400, 400), 
+                    opset_version: int = 17):
     """
     Converte o modelo FingerNet para ONNX.
     
@@ -103,6 +150,7 @@ def convert_to_onnx(weights_path: str, output_path: str, include_minutiae: bool 
         weights_path: Caminho para os pesos do modelo (.pth)
         output_path: Caminho de saída para o arquivo ONNX
         include_minutiae: Se False, exporta apenas segmentação + enhancement (sem minúcias)
+        native_resolution: Se True, exporta saídas em resolução nativa 1/8 (sem upsampling)
         input_shape: Shape da entrada (batch, channels, height, width)
         opset_version: Versão do opset ONNX (default 17)
     """
@@ -126,6 +174,14 @@ def convert_to_onnx(weights_path: str, output_path: str, include_minutiae: bool 
             'minutiae_y_offset',
             'minutiae_score'
         ]
+    elif native_resolution:
+        print("Exportando modelo em RESOLUÇÃO NATIVA 1/8 (seg + ori em 1/8, enhanced em full res)")
+        model = FingerNetNativeResolution(fingernet_full)
+        output_names = [
+            'segmentation_native',
+            'orientation_native',
+            'enhanced_image'
+        ]
     else:
         print("Exportando modelo SEM minúcias (apenas segmentação + enhancement)")
         model = FingerNetSegmentationEnhancement(fingernet_full)
@@ -136,7 +192,7 @@ def convert_to_onnx(weights_path: str, output_path: str, include_minutiae: bool 
         ]
     
     # Wrapper para ONNX (converte dict para tuple)
-    model_wrapper = FingerNetONNXWrapper(model, include_minutiae)
+    model_wrapper = FingerNetONNXWrapper(model, include_minutiae, native_resolution)
     
     # Cria input dummy
     dummy_input = torch.randn(*input_shape)
@@ -204,6 +260,8 @@ Exemplos:
                         help='Caminho de saída para o arquivo ONNX')
     parser.add_argument('--no-minutiae', action='store_true',
                         help='Exporta apenas segmentação + enhancement (sem extração de minúcias)')
+    parser.add_argument('--native-resolution', action='store_true',
+                        help='Exporta saídas em resolução nativa 1/8 (sem upsampling, apenas seg + ori)')
     parser.add_argument('--batch-size', type=int, default=1,
                         help='Batch size para a entrada (default: 1)')
     parser.add_argument('--height', type=int, default=400,
@@ -220,6 +278,11 @@ Exemplos:
         print(f"Erro: Arquivo de pesos não encontrado: {args.weights}")
         sys.exit(1)
     
+    # Valida combinação de argumentos
+    if args.native_resolution and not args.no_minutiae:
+        print("Aviso: --native-resolution implica --no-minutiae. Ajustando automaticamente.")
+        args.no_minutiae = True
+    
     # Cria diretório de saída se não existir
     output_dir = os.path.dirname(args.output)
     if output_dir and not os.path.exists(output_dir):
@@ -231,6 +294,7 @@ Exemplos:
         weights_path=args.weights,
         output_path=args.output,
         include_minutiae=not args.no_minutiae,
+        native_resolution=args.native_resolution,
         input_shape=input_shape,
         opset_version=args.opset
     )

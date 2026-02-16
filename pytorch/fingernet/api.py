@@ -21,7 +21,8 @@ from .fnet_utils import get_fingernet_logger, FnetTimer, DEFAULT_WEIGHTS_PATH
 
 logger = get_fingernet_logger('fingernet.api', level=logging.DEBUG)
 
-torch.set_float32_matmul_precision("medium")
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 class FingerprintDataset(Dataset):
     """Dataset for loading fingerprint images."""
@@ -196,6 +197,38 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
     angles_deg_shifted = np.round(np.rad2deg(ori_cpu) + 90).astype(np.uint8)
     Image.fromarray(angles_deg_shifted).save(orientation_path)
 
+    # Save quality mask (.png) if present
+    if 'quality_mask' in result_item:
+        qmask_path = os.path.join(output_path, "quality_mask", rel_dir, original_filename)
+        os.makedirs(os.path.dirname(qmask_path), exist_ok=True)
+        Image.fromarray(result_item["quality_mask"]).save(qmask_path)
+
+    # Save unmodulated enhanced image (.png) if present
+    if 'enhanced_image_unmod' in result_item:
+        path = os.path.join(output_path, "enhanced_unmod", rel_dir, original_filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.fromarray(result_item["enhanced_image_unmod"]).save(path)
+
+    # Save unmodulated orientation field (encoded as PNG) if present
+    if 'orientation_field_unmod' in result_item:
+        path = os.path.join(output_path, "ori_unmod", rel_dir, original_filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        angles = np.round(np.rad2deg(result_item["orientation_field_unmod"]) + 90).astype(np.uint8)
+        Image.fromarray(angles).save(path)
+
+    # Save unmodulated minutiae (.txt) if present
+    if 'minutiae_unmod' in result_item:
+        mnt_unmod = result_item["minutiae_unmod"].copy()
+        if mnt_degrees:
+            mnt_unmod[:, 2] = np.round(np.rad2deg(mnt_unmod[:, 2]), 2)
+        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.txt")
+        os.makedirs(os.path.dirname(mnt_unmod_path), exist_ok=True)
+        np.savetxt(
+            mnt_unmod_path, mnt_unmod,
+            fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
+            header="x, y, angle, score", delimiter=","
+        )
+
 def postprocess_and_save_batch(
     raw_outputs_cpu: dict,
     batch_paths: list[str],
@@ -203,7 +236,9 @@ def postprocess_and_save_batch(
     padded_shape: tuple,
     output_path: str,
     mnt_degrees: bool,
-    input_base_path: str = None
+    input_base_path: str = None,
+    quality_mask: bool = False,
+    unmodulated: bool = False
 ):
     """Executa pós-processamento e salva os resultados de um lote."""
     worker_id = threading.get_ident()
@@ -211,7 +246,8 @@ def postprocess_and_save_batch(
     logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
         with FnetTimer("Post-processing", logger) as t_post:
-            final_outputs = postprocess(raw_outputs_cpu, threshold=0.5)
+            final_outputs = postprocess(raw_outputs_cpu, threshold=0.5,
+                                        quality_mask=quality_mask, unmodulated=unmodulated)
 
         padded_h, padded_w = padded_shape
 
@@ -220,9 +256,6 @@ def postprocess_and_save_batch(
 
             minutiae = final_outputs["minutiae"][i].numpy()
 
-            # Correção de coordenadas devido ao padding dinâmico
-            # Esta lógica precisa ser ajustada, pois o padding era centralizado.
-            # Por simplicidade, assumimos padding à direita/inferior como no código original.
             enhanced_img = final_outputs["enhanced_image"][i][:orig_h, :orig_w].numpy()
             seg_mask = final_outputs["segmentation_mask"][i][:orig_h, :orig_w].numpy()
             ori_field = final_outputs["orientation_field"][i][:orig_h, :orig_w].numpy()
@@ -234,6 +267,14 @@ def postprocess_and_save_batch(
                 "segmentation_mask": seg_mask,
                 "orientation_field": ori_field,
             }
+
+            if quality_mask:
+                result_item["quality_mask"] = final_outputs["quality_mask"][i][:orig_h, :orig_w].numpy()
+            if unmodulated:
+                result_item["enhanced_image_unmod"] = final_outputs["enhanced_image_unmod"][i][:orig_h, :orig_w].numpy()
+                result_item["orientation_field_unmod"] = final_outputs["orientation_field_unmod"][i][:orig_h, :orig_w].numpy()
+                result_item["minutiae_unmod"] = final_outputs["minutiae_unmod"][i].numpy()
+
             save_results(result_item, output_path, mnt_degrees, input_base_path)
 
         
@@ -247,12 +288,18 @@ def postprocess_and_save_batch(
     except Exception as e:
         warnings.warn(f"Falha no pós-processamento do lote iniciado com {os.path.basename(batch_paths[0])}. Erro: {e}")
 
-def create_output_directories(output_path: str):
+def create_output_directories(output_path: str, quality_mask: bool = False, unmodulated: bool = False):
     """Create output directory structure."""
     os.makedirs(os.path.join(output_path, "minutiae"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "mask"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "enhanced"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "ori"), exist_ok=True)
+    if quality_mask:
+        os.makedirs(os.path.join(output_path, "quality_mask"), exist_ok=True)
+    if unmodulated:
+        os.makedirs(os.path.join(output_path, "enhanced_unmod"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "ori_unmod"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "minutiae_unmod"), exist_ok=True)
 
 def setup_ddp(rank: int, world_size: int, gpu_id: int, timeout_minutes: int = 30):
     """
@@ -308,6 +355,9 @@ def run_inference(
     max_image_dim: int = 1024,
     strategy: str = 'hybrid',
     num_cpu_workers: int = 4,
+    quality_mask: bool = False,
+    unmodulated: bool = False,
+    full: bool = False,
 ):
     """
     Run FingerNet inference on images.
@@ -330,6 +380,10 @@ def run_inference(
     Example:
         >>> run_inference('images/', 'output/', gpus=2, batch_size=8)
     """
+    if full:
+        quality_mask = True
+        unmodulated = True
+
     image_paths = find_image_paths(input_path, recursive)
 
     # Determine the base path for preserving directory structure
@@ -444,7 +498,11 @@ class InferenceRunner:
 
         if self.is_main_process:
             logger.info(f"Setting up runner on device: {self.device}")
-            create_output_directories(self.config['output_path'])
+            create_output_directories(
+                self.config['output_path'],
+                quality_mask=self.config.get('quality_mask', False),
+                unmodulated=self.config.get('unmodulated', False)
+            )
         
         if self.world_size > 1:
             dist.barrier() # Garante que as pastas foram criadas
@@ -534,7 +592,9 @@ class InferenceRunner:
                         postprocess_and_save_batch,
                         raw_outputs_cpu, batch_paths, batch_orig_shapes,
                         (padded_h, padded_w), self.config['output_path'], self.config['mnt_degrees'],
-                        self.config.get('input_base_path')
+                        self.config.get('input_base_path'),
+                        self.config.get('quality_mask', False),
+                        self.config.get('unmodulated', False)
                     )
                     futures.append(future)
 
@@ -574,7 +634,9 @@ class InferenceRunner:
 
                     # --- ETAPA GPU: Inferência E Pós-processamento ---
                     batch_tensors = batch_tensors.to(self.device)
-                    final_outputs = self.model(batch_tensors)
+                    _qm = self.config.get('quality_mask', False)
+                    _um = self.config.get('unmodulated', False)
+                    final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um)
 
                     # --- ETAPA DE TRANSFERÊNCIA E COLETA (RÁPIDA) ---
                     for i in range(len(batch_paths)):
@@ -586,6 +648,12 @@ class InferenceRunner:
                             'segmentation_mask': final_outputs['segmentation_mask'][i][:orig_h, :orig_w].cpu().numpy(),
                             'orientation_field': final_outputs['orientation_field'][i][:orig_h, :orig_w].cpu().numpy(),
                         }
+                        if _qm and 'quality_mask' in final_outputs:
+                            result_item['quality_mask'] = final_outputs['quality_mask'][i][:orig_h, :orig_w].cpu().numpy()
+                        if _um:
+                            result_item['enhanced_image_unmod'] = final_outputs['enhanced_image_unmod'][i][:orig_h, :orig_w].cpu().numpy()
+                            result_item['orientation_field_unmod'] = final_outputs['orientation_field_unmod'][i][:orig_h, :orig_w].cpu().numpy()
+                            result_item['minutiae_unmod'] = final_outputs['minutiae_unmod'][i].cpu().numpy()
                         chunk_para_salvar.append(result_item)
 
                     # --- ETAPA DE DESPACHO PARA WORKERS ---

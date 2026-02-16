@@ -14,27 +14,31 @@ class FingerNetWrapper(nn.Module):
         super().__init__()
         self.fingernet = model
 
-    def forward(self, x: torch.Tensor, minutiae_threshold: float = 0.5) -> dict[str, torch.Tensor]:
-        
-        padded_x = self.preprocess(x)
-        
-        with torch.no_grad():
-            raw_outputs = self.fingernet(padded_x) 
+    def forward(self, x: torch.Tensor, minutiae_threshold: float = 0.5,
+                quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
 
-        post_x = self.postprocess(raw_outputs, minutiae_threshold)
+        padded_x = self.preprocess(x)
+
+        with torch.no_grad():
+            raw_outputs = self.fingernet(padded_x)
+
+        post_x = self.postprocess(raw_outputs, minutiae_threshold,
+                                  quality_mask=quality_mask, unmodulated=unmodulated)
 
         return post_x
 
-    def time(self, x: torch.Tensor, minutiae_threshold: float = 0.5) -> dict[str, torch.Tensor]:
-        
+    def time(self, x: torch.Tensor, minutiae_threshold: float = 0.5,
+             quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
+
         padded_x = self.preprocess(x)
-        
+
         with torch.no_grad():
             with FnetTimer("Full Inference", logger):
                 raw_outputs = self.fingernet.time(padded_x)
 
         with FnetTimer("Post-processing", logger):
-            post_x = self.postprocess_time(raw_outputs, minutiae_threshold)
+            post_x = self.postprocess_time(raw_outputs, minutiae_threshold,
+                                           quality_mask=quality_mask, unmodulated=unmodulated)
 
         return post_x
 
@@ -67,11 +71,13 @@ class FingerNetWrapper(nn.Module):
         pad_w = (8 - w % 8) % 8
         return F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
 
-    def postprocess(self, outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
-        return postprocess(outputs, threshold)
+    def postprocess(self, outputs: dict, threshold: float,
+                    quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
+        return postprocess(outputs, threshold, quality_mask=quality_mask, unmodulated=unmodulated)
 
-    def postprocess_time(self, outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
-        return postprocess_time(outputs, threshold)
+    def postprocess_time(self, outputs: dict, threshold: float,
+                         quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
+        return postprocess_time(outputs, threshold, quality_mask=quality_mask, unmodulated=unmodulated)
 
 def get_fingernet(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNetWrapper:
     if not os.path.exists(weights_path):
@@ -95,7 +101,8 @@ def get_fingernet(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAUL
     
     return fnet_wrapper
 
-def postprocess(outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
+def postprocess(outputs: dict, threshold: float,
+                quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
     # 1. Binarização e limpeza da máscara de segmentação
     cleaned_mask = _post_binarize_mask_fast(outputs['segmentation'])
     cleaned_mask_up = torch.nn.functional.interpolate(
@@ -105,8 +112,11 @@ def postprocess(outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
     ).squeeze(1)
 
     # 2. Detecção de minúcias (incluindo NMS)
-    # O resultado é uma lista de tensores, um para cada imagem no lote.
-    final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
+    if unmodulated:
+        final_minutiae_list, final_minutiae_unmod_list = _post_detect_minutiae(
+            outputs, cleaned_mask, threshold, unmodulated=True)
+    else:
+        final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
 
     # 3. Processamento do campo de orientação
     ori = outputs['orientation']
@@ -116,13 +126,14 @@ def postprocess(outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
         scale_factor=8,
         mode='nearest'
     ).squeeze(1)
-    orientation_field = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
-    orientation_field = orientation_field * cleaned_mask_up
+    orientation_field_raw = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
+    orientation_field = orientation_field_raw * cleaned_mask_up
 
     # 4. Processamento da imagem melhorada
     enh_real = outputs['enhanced_real'].squeeze(1)
+    enh_real_raw = enh_real  # referência antes da modulação
     enh_real = enh_real * cleaned_mask_up
-    
+
     # Normalização Min-Max para visualização
     b, h, w = enh_real.shape
     enh_flat = enh_real.view(b, -1)
@@ -131,14 +142,33 @@ def postprocess(outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
     enh_norm = (enh_flat - enh_min) / (enh_max - enh_min + 1e-8)
     enh_visual = (enh_norm.view(b, h, w) * 255).byte()
 
-    return {
+    result = {
         'minutiae': final_minutiae_list,
         'enhanced_image': enh_visual,
         'segmentation_mask': (cleaned_mask_up * 255).byte(),
         'orientation_field': orientation_field
     }
 
-def postprocess_time(outputs: dict, threshold: float) -> dict[str, torch.Tensor]:
+    if quality_mask:
+        seg_continuous_up = torch.nn.functional.interpolate(
+            outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
+        ).squeeze(1)
+        result['quality_mask'] = (seg_continuous_up * 255).byte()
+
+    if unmodulated:
+        result['orientation_field_unmod'] = orientation_field_raw
+        result['minutiae_unmod'] = final_minutiae_unmod_list
+        # Enhanced não-modulado normalizado
+        enh_flat_raw = enh_real_raw.view(b, -1)
+        enh_min_raw = enh_flat_raw.min(dim=1, keepdim=True)[0]
+        enh_max_raw = enh_flat_raw.max(dim=1, keepdim=True)[0]
+        enh_norm_raw = (enh_flat_raw - enh_min_raw) / (enh_max_raw - enh_min_raw + 1e-8)
+        result['enhanced_image_unmod'] = (enh_norm_raw.view(b, h, w) * 255).byte()
+
+    return result
+
+def postprocess_time(outputs: dict, threshold: float,
+                     quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
     # 1. Binarização e limpeza da máscara de segmentação
     with FnetTimer("Mask Binarization and Cleaning", logger):
         cleaned_mask = _post_binarize_mask_fast(outputs['segmentation'])
@@ -149,9 +179,12 @@ def postprocess_time(outputs: dict, threshold: float) -> dict[str, torch.Tensor]
         ).squeeze(1)
 
     # 2. Detecção de minúcias (incluindo NMS)
-    # O resultado é uma lista de tensores, um para cada imagem no lote.
     with FnetTimer("Minutiae Detection", logger):
-        final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
+        if unmodulated:
+            final_minutiae_list, final_minutiae_unmod_list = _post_detect_minutiae(
+                outputs, cleaned_mask, threshold, unmodulated=True)
+        else:
+            final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
 
     # 3. Processamento do campo de orientação
     with FnetTimer("Orientation Field Processing", logger):
@@ -162,14 +195,15 @@ def postprocess_time(outputs: dict, threshold: float) -> dict[str, torch.Tensor]
             scale_factor=8,
             mode='nearest'
         ).squeeze(1)
-        orientation_field = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
-        orientation_field = orientation_field * cleaned_mask_up
+        orientation_field_raw = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
+        orientation_field = orientation_field_raw * cleaned_mask_up
 
     # 4. Processamento da imagem melhorada
     with FnetTimer("Enhanced Image Processing", logger):
         enh_real = outputs['enhanced_real'].squeeze(1)
+        enh_real_raw = enh_real
         enh_real = enh_real * cleaned_mask_up
-    
+
     # Normalização Min-Max para visualização
     with FnetTimer("Enhanced Image Normalization", logger):
         b, h, w = enh_real.shape
@@ -179,12 +213,29 @@ def postprocess_time(outputs: dict, threshold: float) -> dict[str, torch.Tensor]
         enh_norm = (enh_flat - enh_min) / (enh_max - enh_min + 1e-8)
         enh_visual = (enh_norm.view(b, h, w) * 255).byte()
 
-    return {
+    result = {
         'minutiae': final_minutiae_list,
         'enhanced_image': enh_visual,
         'segmentation_mask': (cleaned_mask_up * 255).byte(),
         'orientation_field': orientation_field
     }
+
+    if quality_mask:
+        seg_continuous_up = torch.nn.functional.interpolate(
+            outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
+        ).squeeze(1)
+        result['quality_mask'] = (seg_continuous_up * 255).byte()
+
+    if unmodulated:
+        result['orientation_field_unmod'] = orientation_field_raw
+        result['minutiae_unmod'] = final_minutiae_unmod_list
+        enh_flat_raw = enh_real_raw.view(b, -1)
+        enh_min_raw = enh_flat_raw.min(dim=1, keepdim=True)[0]
+        enh_max_raw = enh_flat_raw.max(dim=1, keepdim=True)[0]
+        enh_norm_raw = (enh_flat_raw - enh_min_raw) / (enh_max_raw - enh_min_raw + 1e-8)
+        result['enhanced_image_unmod'] = (enh_norm_raw.view(b, h, w) * 255).byte()
+
+    return result
 
 
 def _post_binarize_mask(self, seg_map: torch.Tensor) -> torch.Tensor:
@@ -251,40 +302,57 @@ def _post_binarize_mask_fast(seg_map: torch.Tensor) -> torch.Tensor:
 
     return cleaned_mask.squeeze(1)
 
-def _post_detect_minutiae(outputs: dict, cleaned_mask: torch.Tensor, threshold: float) -> list:
+def _post_detect_minutiae_single(mnt_score, mnt_orient_batch_i, mnt_x_offset_batch_i,
+                                  mnt_y_offset_batch_i, threshold, device):
+    """Detecta e aplica NMS nas minúcias para uma única imagem."""
+    rows, cols = torch.where(mnt_score > threshold)
+    if rows.shape[0] == 0:
+        return torch.empty((0, 4), device=device)
+
+    scores = mnt_score[rows, cols]
+    angles_idx = torch.argmax(mnt_orient_batch_i[:, rows, cols], dim=0)
+    x_offsets = torch.argmax(mnt_x_offset_batch_i[:, rows, cols], dim=0)
+    y_offsets = torch.argmax(mnt_y_offset_batch_i[:, rows, cols], dim=0)
+
+    angles = (angles_idx * 2.0 - 89.0) * (torch.pi / 180.0)
+    x_coords = cols * 8.0 + x_offsets
+    y_coords = rows * 8.0 + y_offsets
+
+    minutiae_raw = torch.stack([x_coords, y_coords, angles, scores], dim=-1)
+    return _post_nms(minutiae_raw)
+
+
+def _post_detect_minutiae(outputs: dict, cleaned_mask: torch.Tensor, threshold: float,
+                          unmodulated: bool = False):
     """Detecta, filtra e aplica NMS nas minúcias para um lote inteiro."""
     mnt_score_batch = outputs['minutiae_score'].squeeze(1) * cleaned_mask
     mnt_orient_batch = outputs['minutiae_orientation']
     mnt_x_offset_batch = outputs['minutiae_x_offset']
     mnt_y_offset_batch = outputs['minutiae_y_offset']
-    
+
+    if unmodulated:
+        mnt_score_batch_unmod = outputs['minutiae_score'].squeeze(1)
+
     batch_size = mnt_score_batch.shape[0]
     final_minutiae_list = []
+    final_minutiae_unmod_list = [] if unmodulated else None
 
     for i in range(batch_size):
-        # Encontra coordenadas das minúcias acima do limiar
-        rows, cols = torch.where(mnt_score_batch[i] > threshold)
-        if rows.shape[0] == 0:
-            final_minutiae_list.append(torch.empty((0, 4), device=mnt_score_batch.device))
-            continue
+        final_minutiae_list.append(
+            _post_detect_minutiae_single(
+                mnt_score_batch[i], mnt_orient_batch[i],
+                mnt_x_offset_batch[i], mnt_y_offset_batch[i],
+                threshold, mnt_score_batch.device))
 
-        # Extrai scores, ângulos e offsets
-        scores = mnt_score_batch[i][rows, cols]
-        angles_idx = torch.argmax(mnt_orient_batch[i, :, rows, cols], dim=0)
-        x_offsets = torch.argmax(mnt_x_offset_batch[i, :, rows, cols], dim=0)
-        y_offsets = torch.argmax(mnt_y_offset_batch[i, :, rows, cols], dim=0)
-        
-        # Calcula valores finais
-        angles = (angles_idx * 2.0 - 89.0) * (torch.pi / 180.0)
-        x_coords = cols * 8.0 + x_offsets
-        y_coords = rows * 8.0 + y_offsets
-        
-        minutiae_raw = torch.stack([x_coords, y_coords, angles, scores], dim=-1)
-        
-        # Aplica NMS
-        final_minutiae = _post_nms(minutiae_raw)
-        final_minutiae_list.append(final_minutiae)
-        
+        if unmodulated:
+            final_minutiae_unmod_list.append(
+                _post_detect_minutiae_single(
+                    mnt_score_batch_unmod[i], mnt_orient_batch[i],
+                    mnt_x_offset_batch[i], mnt_y_offset_batch[i],
+                    threshold, mnt_score_batch.device))
+
+    if unmodulated:
+        return final_minutiae_list, final_minutiae_unmod_list
     return final_minutiae_list
 
 def _post_nms(minutiae: torch.Tensor, dist_thresh: float = 16.0, angle_thresh: float = torch.pi/6) -> torch.Tensor:

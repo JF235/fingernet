@@ -21,8 +21,7 @@ from .fnet_utils import get_fingernet_logger, FnetTimer, DEFAULT_WEIGHTS_PATH
 
 logger = get_fingernet_logger('fingernet.api', level=logging.DEBUG)
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
+torch.set_float32_matmul_precision('high')
 
 class FingerprintDataset(Dataset):
     """Dataset for loading fingerprint images."""
@@ -165,19 +164,26 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
     
     base_name = os.path.splitext(original_filename)[0]
 
-    # Save minutiae (.txt)
+    # Save minutiae (.min) - padrão: ângulo CCW em graus (int), qualidade 0-100 (int)
     minutiae = result_item["minutiae"].copy()
-    if mnt_degrees:
-        minutiae[:, 2] = np.round(np.rad2deg(minutiae[:, 2]), 2)
+    angle_ccw_deg = np.round((-np.rad2deg(minutiae[:, 2])) % 360).astype(int)
+    quality_int = np.round(minutiae[:, 3] * 100).astype(int)
+    minutiae_out = np.column_stack([
+        minutiae[:, 0].astype(int),
+        minutiae[:, 1].astype(int),
+        angle_ccw_deg,
+        quality_int,
+    ])
 
-    minutiae_path = os.path.join(output_path, "minutiae", rel_dir, f"{base_name}.txt")
+    minutiae_path = os.path.join(output_path, "minutiae", rel_dir, f"{base_name}.min")
     os.makedirs(os.path.dirname(minutiae_path), exist_ok=True)
     np.savetxt(
         minutiae_path,
-        minutiae,
-        fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
-        header="x, y, angle, score",
-        delimiter=",",
+        minutiae_out,
+        fmt="%d",
+        header="X Y ANGLE QUALITY",
+        comments="#MIN ",
+        delimiter=" ",
     )
 
     # Save enhanced image (.png)
@@ -216,17 +222,23 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
         angles = np.round(np.rad2deg(result_item["orientation_field_unmod"]) + 90).astype(np.uint8)
         Image.fromarray(angles).save(path)
 
-    # Save unmodulated minutiae (.txt) if present
+    # Save unmodulated minutiae (.min) if present
     if 'minutiae_unmod' in result_item:
         mnt_unmod = result_item["minutiae_unmod"].copy()
-        if mnt_degrees:
-            mnt_unmod[:, 2] = np.round(np.rad2deg(mnt_unmod[:, 2]), 2)
-        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.txt")
+        angle_ccw_deg_unmod = np.round((-np.rad2deg(mnt_unmod[:, 2])) % 360).astype(int)
+        quality_int_unmod = np.round(mnt_unmod[:, 3] * 100).astype(int)
+        mnt_unmod_out = np.column_stack([
+            mnt_unmod[:, 0].astype(int),
+            mnt_unmod[:, 1].astype(int),
+            angle_ccw_deg_unmod,
+            quality_int_unmod,
+        ])
+        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.min")
         os.makedirs(os.path.dirname(mnt_unmod_path), exist_ok=True)
         np.savetxt(
-            mnt_unmod_path, mnt_unmod,
-            fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
-            header="x, y, angle, score", delimiter=","
+            mnt_unmod_path, mnt_unmod_out,
+            fmt="%d",
+            header="X Y ANGLE QUALITY", comments="#MIN ", delimiter=" "
         )
 
 def postprocess_and_save_batch(

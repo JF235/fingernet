@@ -223,7 +223,7 @@ def plot_from_output_folder(
 
     enhanced_path = find_file_by_dir_patterns(output_path, enhanced_dirs, image_basename)
     orientation_path = find_file_by_dir_patterns(output_path, orientation_dirs, image_basename)
-    minutiae_path = find_file_by_dir_patterns(output_path, minutiae_dirs, f"{base_name}.txt")
+    minutiae_path = find_file_by_dir_patterns(output_path, minutiae_dirs, f"{base_name}.min")
 
     # Verifica se todos os arquivos necessários existem
     for name, path in (('enhanced', enhanced_path), ('orientation', orientation_path), ('minutiae', minutiae_path)):
@@ -240,12 +240,14 @@ def plot_from_output_folder(
     # orientation_img is stored in degrees in many pipelines; subtract 90 then convert
     orientation_field = np.deg2rad(orientation_img.astype(np.float32) - 90.0)
 
-    minutiae = np.loadtxt(minutiae_path, delimiter=',', skiprows=1)
+    minutiae = np.loadtxt(minutiae_path, comments='#')
     if minutiae.ndim == 1 and minutiae.size > 0: # Garante que funcione para uma única minúcia
         minutiae = np.expand_dims(minutiae, 0)
     elif minutiae.size == 0: # Lida com o caso de nenhuma minúcia encontrada
         minutiae = np.empty((0, 4))
 
+    # Converte ângulo do padrão .min (CCW graus) para radianos CW (para plotagem em coords de tela)
+    minutiae[:, 2] = (-np.deg2rad(minutiae[:, 2])) % (2 * np.pi)
 
     # --- Cria a figura com 3 subplots (lógica de plotagem inalterada) ---
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -261,9 +263,6 @@ def plot_from_output_folder(
 
     # 3. Imagem melhorada + minúcias
     plot_img(axes[2], enhanced_image)
-    # Convert minutiae angle column to radians if necessary
-    if degrees:
-        minutiae[:, 2] = np.deg2rad(minutiae[:, 2])
     plot_mnt(axes[2], minutiae)
     axes[2].set_title(f"Minúcias Detectadas ({len(minutiae)})")
 

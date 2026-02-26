@@ -413,7 +413,15 @@ def run_inference(
 
     # Determina o modo de execução
     use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
-    is_ddp = isinstance(gpus, int) and gpus > 1 or isinstance(gpus, list)
+
+    # Normalize single-element list to single-GPU: [3] → single GPU on device 3
+    single_gpu_id = None
+    if isinstance(gpus, list) and len(gpus) == 1:
+        single_gpu_id = gpus[0]
+    elif isinstance(gpus, int) and gpus == 1:
+        single_gpu_id = 0
+
+    is_ddp = single_gpu_id is None and not use_cpu
 
     if use_cpu:
         logger.info("Starting Inference on CPU")
@@ -425,7 +433,7 @@ def run_inference(
         gpu_ids = list(range(gpus)) if isinstance(gpus, int) else gpus
         world_size = len(gpu_ids)
         logger.info(f"Starting Distributed Inference on {world_size} GPUs: {gpu_ids}")
-        
+
         mp.spawn(
             _ddp_launch_target,
             nprocs=world_size,
@@ -433,9 +441,8 @@ def run_inference(
             join=True
         )
     else: # Single GPU
-        gpu_id = 0 if gpus == 1 else gpus[0]
-        logger.info(f"Starting Inference on single GPU: {gpu_id}")
-        
+        logger.info(f"Starting Inference on single GPU: {single_gpu_id}")
+
         # Para single GPU, definir CUDA_VISIBLE_DEVICES simplifica
         # e o setup usará cuda:0 (que é a GPU física gpu_id)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)

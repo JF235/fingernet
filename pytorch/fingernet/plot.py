@@ -173,11 +173,12 @@ def plot_output(
 
 
 def plot_from_output_folder(
-    output_path: str, 
-    image_filename: str, 
-    save_path: str | None = None, 
+    output_path: str,
+    image_filename: str,
+    save_path: str | None = None,
     stride: int = 16,
-    degrees: bool = False
+    degrees: bool = False,
+    input_path: str | None = None,
 ):
     """
     Plota os resultados da inferência a partir da nova estrutura de pastas,
@@ -235,7 +236,10 @@ def plot_from_output_folder(
             return
 
     # Carrega os dados dos arquivos
-    enhanced_image = np.array(Image.open(enhanced_path).convert('L'))
+    if input_path is not None:
+        display_image = np.array(Image.open(input_path).convert('L'))
+    else:
+        display_image = np.array(Image.open(enhanced_path).convert('L'))
     orientation_img = np.array(Image.open(orientation_path))
     # orientation_img is stored in degrees in many pipelines; subtract 90 then convert
     orientation_field = np.deg2rad(orientation_img.astype(np.float32) - 90.0)
@@ -252,17 +256,17 @@ def plot_from_output_folder(
     # --- Cria a figura com 3 subplots (lógica de plotagem inalterada) ---
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-    # 1. Imagem melhorada
-    plot_img(axes[0], enhanced_image)
-    axes[0].set_title("Imagem Melhorada")
+    # 1. Imagem
+    plot_img(axes[0], display_image)
+    axes[0].set_title("Imagem Original" if input_path is not None else "Imagem Melhorada")
 
-    # 2. Imagem melhorada + campo de orientação
-    plot_img(axes[1], enhanced_image)
+    # 2. Imagem + campo de orientação
+    plot_img(axes[1], display_image)
     plot_ori_field(axes[1], orientation_field, stride=stride)
     axes[1].set_title(f"Campo de Orientação (Stride: {stride})")
 
-    # 3. Imagem melhorada + minúcias
-    plot_img(axes[2], enhanced_image)
+    # 3. Imagem + minúcias
+    plot_img(axes[2], display_image)
     plot_mnt(axes[2], minutiae)
     axes[2].set_title(f"Minúcias Detectadas ({len(minutiae)})")
 

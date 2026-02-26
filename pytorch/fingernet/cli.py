@@ -102,7 +102,8 @@ def plot_command(args):
         image_filename=args.image,
         save_path=args.save,
         stride=args.stride,
-        degrees=args.degrees
+        degrees=args.degrees,
+        input_path=args.input_image,
     )
 
 
@@ -222,6 +223,10 @@ Examples:
     plot_parser.add_argument(
         '--degrees', action='store_true',
         help='Interpret stored orientation/minutiae angles as degrees (convert to radians before plotting)'
+    )
+    plot_parser.add_argument(
+        '--input-image', type=str, default=None,
+        help='Path to original input image (default: use enhanced image)'
     )
     plot_parser.set_defaults(func=plot_command)
     

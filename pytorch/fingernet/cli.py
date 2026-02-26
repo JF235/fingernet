@@ -36,10 +36,17 @@ def parse_gpus(gpus_str: str):
 
 def infer_command(args):
     """Execute full inference (forward pass)."""
-    # Lazy import to keep `fingernet -h` fast
-    from .api import run_inference
+    import os
 
     gpus = parse_gpus(args.gpus)
+
+    # Set CUDA_VISIBLE_DEVICES BEFORE importing api.py, which runs
+    # torch.set_float32_matmul_precision() at import time and may
+    # initialize the CUDA runtime (locking the device list).
+    if isinstance(gpus, list) and len(gpus) == 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
+
+    from .api import run_inference
     
     print(f"\n{'='*70}")
     print("FingerNet - Full Inference")

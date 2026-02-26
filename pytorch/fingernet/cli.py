@@ -40,20 +40,8 @@ def infer_command(args):
 
     gpus = parse_gpus(args.gpus)
 
-    # Set CUDA_VISIBLE_DEVICES BEFORE importing api.py, which runs
-    # torch.set_float32_matmul_precision() at import time and may
-    # initialize the CUDA runtime (locking the device list).
-    if isinstance(gpus, list) and len(gpus) == 1:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
-        print(f"[DEBUG] Set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
-
-    print(f"[DEBUG] Before api import: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
+    # CUDA_VISIBLE_DEVICES is set early in _early_set_cuda_visible_devices()
     from .api import run_inference
-    import torch
-    print(f"[DEBUG] After api import: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
-    print(f"[DEBUG] torch.cuda.device_count()={torch.cuda.device_count()}")
-    print(f"[DEBUG] torch.cuda.current_device()={torch.cuda.current_device()}")
-    print(f"[DEBUG] torch.cuda.get_device_name(0)={torch.cuda.get_device_name(0)}")
     
     print(f"\n{'='*70}")
     print("FingerNet - Full Inference")
@@ -121,8 +109,26 @@ def plot_command(args):
     )
 
 
+def _early_set_cuda_visible_devices():
+    """Parse --gpus from sys.argv before any imports and set CUDA_VISIBLE_DEVICES.
+
+    Must run before torch is imported (even indirectly) because the CUDA
+    runtime reads the env var once at initialization and ignores later changes.
+    """
+    import os
+    for i, arg in enumerate(sys.argv):
+        if arg == '--gpus' and i + 1 < len(sys.argv):
+            gpus_str = sys.argv[i + 1]
+            gpus = parse_gpus(gpus_str)
+            if isinstance(gpus, list) and len(gpus) == 1:
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
+            break
+
+
 def main():
     """Main CLI entry point."""
+    _early_set_cuda_visible_devices()
+
     parser = argparse.ArgumentParser(
         prog='fingernet',
         description='FingerNet - Advanced Fingerprint Analysis',

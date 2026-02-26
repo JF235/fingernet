@@ -411,22 +411,25 @@ def run_inference(
     # Coleta toda a configuração em um único dicionário para facilitar
     config = locals()
 
-    # Determina o modo de execução
-    use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
-
-    # Normalize single-element list to single-GPU: [3] → single GPU on device 3
+    # Normalize single-element list: [3] → single GPU on device 3
     single_gpu_id = None
     if isinstance(gpus, list) and len(gpus) == 1:
         single_gpu_id = gpus[0]
     elif isinstance(gpus, int) and gpus == 1:
         single_gpu_id = 0
 
+    # Set CUDA_VISIBLE_DEVICES BEFORE any torch.cuda call (which initializes
+    # the CUDA runtime and locks the device list).
+    if single_gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(single_gpu_id)
+
+    use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
     is_ddp = single_gpu_id is None and not use_cpu
 
     if use_cpu:
         logger.info("Starting Inference on CPU")
         runner = InferenceRunner(config)
-        runner.setup() # rank=-1, world_size=1 (padrão)
+        runner.setup()
         runner.run()
 
     elif is_ddp:
@@ -442,13 +445,9 @@ def run_inference(
         )
     else: # Single GPU
         logger.info(f"Starting Inference on single GPU: {single_gpu_id}")
-
-        # Para single GPU, definir CUDA_VISIBLE_DEVICES simplifica
-        # e o setup usará cuda:0 (que é a GPU física single_gpu_id)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(single_gpu_id)
-        config['gpus'] = True # Sinaliza para o setup usar cuda
+        config['gpus'] = True
         runner = InferenceRunner(config)
-        runner.setup()  # Usa cuda:0 após CUDA_VISIBLE_DEVICES
+        runner.setup()  # Usa cuda:0 (que é a GPU física single_gpu_id)
         runner.run()
 
 

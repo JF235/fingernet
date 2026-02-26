@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 
+
 def parse_gpus(gpus_str: str):
     """
     Parse GPU specification from string.
@@ -20,18 +21,43 @@ def parse_gpus(gpus_str: str):
     
     try:
         # Try to parse as integer
-        return int(gpus_str)
+        parsed_int = int(gpus_str)
     except ValueError:
-        pass
+        parsed_int = None
+    if parsed_int is not None:
+        if parsed_int < 0:
+            raise ValueError("GPU integer must be >= 0")
+        return parsed_int
     
     try:
         # Try to parse as JSON list
         parsed = json.loads(gpus_str)
         if isinstance(parsed, list) and all(isinstance(x, int) for x in parsed):
+            if not parsed:
+                raise ValueError("GPU list cannot be empty")
+            if any(x < 0 for x in parsed):
+                raise ValueError("GPU list must contain only non-negative integers")
+            if len(set(parsed)) != len(parsed):
+                raise ValueError("GPU list cannot contain duplicates")
             return parsed
         raise ValueError("GPU list must contain only integers")
     except json.JSONDecodeError:
         raise ValueError(f"Invalid GPU specification: {gpus_str}")
+
+
+def _to_cuda_visible_devices(gpus: int | list[int]) -> str:
+    """
+    Convert parsed GPU selection to CUDA_VISIBLE_DEVICES value.
+
+    Returns:
+        Comma-separated list of physical GPU IDs, or empty string for CPU mode.
+    """
+    if gpus == 0:
+        return ""
+    if isinstance(gpus, int):
+        # `--gpus N` means "use first N GPUs": [0, 1, ..., N-1]
+        return ",".join(str(i) for i in range(gpus))
+    return ",".join(str(i) for i in gpus)
 
 
 def infer_command(args):
@@ -116,13 +142,21 @@ def _early_set_cuda_visible_devices():
     runtime reads the env var once at initialization and ignores later changes.
     """
     import os
+
+    # Only inference commands use --gpus. For those commands, if --gpus is omitted,
+    # default CLI behavior is equivalent to --gpus 1.
+    inference_cmds = {'infer', 'forward', 'enhance', 'segment'}
+    if len(sys.argv) < 2 or sys.argv[1] not in inference_cmds:
+        return
+
+    gpus_str = '1'
     for i, arg in enumerate(sys.argv):
         if arg == '--gpus' and i + 1 < len(sys.argv):
             gpus_str = sys.argv[i + 1]
-            gpus = parse_gpus(gpus_str)
-            if isinstance(gpus, list) and len(gpus) == 1:
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
             break
+
+    gpus = parse_gpus(gpus_str)
+    os.environ["CUDA_VISIBLE_DEVICES"] = _to_cuda_visible_devices(gpus)
 
 
 def main():

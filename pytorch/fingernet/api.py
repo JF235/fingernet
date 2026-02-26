@@ -444,8 +444,8 @@ def run_inference(
         logger.info(f"Starting Inference on single GPU: {single_gpu_id}")
 
         # Para single GPU, definir CUDA_VISIBLE_DEVICES simplifica
-        # e o setup usará cuda:0 (que é a GPU física gpu_id)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # e o setup usará cuda:0 (que é a GPU física single_gpu_id)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(single_gpu_id)
         config['gpus'] = True # Sinaliza para o setup usar cuda
         runner = InferenceRunner(config)
         runner.setup()  # Usa cuda:0 após CUDA_VISIBLE_DEVICES

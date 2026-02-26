@@ -420,9 +420,19 @@ def run_inference(
     if not use_cpu:
         visible_cuda_count = torch.cuda.device_count()
         if requested_world_size > visible_cuda_count:
+            visible_names = []
+            for i in range(visible_cuda_count):
+                try:
+                    visible_names.append(f"cuda:{i}={torch.cuda.get_device_name(i)}")
+                except Exception:
+                    visible_names.append(f"cuda:{i}=<unavailable>")
+            visible_desc = ", ".join(visible_names) if visible_names else "<none>"
             raise ValueError(
                 f"Requested {requested_world_size} GPU(s), but only {visible_cuda_count} "
-                f"visible to CUDA. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+                f"visible to CUDA. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} | "
+                f"visible devices: {visible_desc}. "
+                "This usually means one or more requested GPU IDs are invalid for this host, "
+                "or a parent environment/scheduler already restricted visible GPUs."
             )
     is_ddp = (not use_cpu and requested_world_size > 1)
 

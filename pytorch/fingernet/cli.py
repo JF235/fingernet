@@ -45,8 +45,15 @@ def infer_command(args):
     # initialize the CUDA runtime (locking the device list).
     if isinstance(gpus, list) and len(gpus) == 1:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
+        print(f"[DEBUG] Set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
 
+    print(f"[DEBUG] Before api import: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
     from .api import run_inference
+    import torch
+    print(f"[DEBUG] After api import: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
+    print(f"[DEBUG] torch.cuda.device_count()={torch.cuda.device_count()}")
+    print(f"[DEBUG] torch.cuda.current_device()={torch.cuda.current_device()}")
+    print(f"[DEBUG] torch.cuda.get_device_name(0)={torch.cuda.get_device_name(0)}")
     
     print(f"\n{'='*70}")
     print("FingerNet - Full Inference")

@@ -20,7 +20,8 @@ from .fnet_utils import get_fingernet_logger, FnetTimer, DEFAULT_WEIGHTS_PATH
 
 logger = get_fingernet_logger('fingernet.api', level=logging.DEBUG)
 
-torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 class FingerprintDataset(Dataset):
     """Dataset for loading fingerprint images."""
@@ -249,7 +250,8 @@ def postprocess_and_save_batch(
     mnt_degrees: bool,
     input_base_path: str = None,
     quality_mask: bool = False,
-    unmodulated: bool = False
+    unmodulated: bool = False,
+    threshold: float = 0.5,
 ):
     """Executa pós-processamento e salva os resultados de um lote."""
     worker_id = threading.get_ident()
@@ -257,7 +259,7 @@ def postprocess_and_save_batch(
     logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
         with FnetTimer("Post-processing", logger) as t_post:
-            final_outputs = postprocess(raw_outputs_cpu, threshold=0.5,
+            final_outputs = postprocess(raw_outputs_cpu, threshold=threshold,
                                         quality_mask=quality_mask, unmodulated=unmodulated)
 
         padded_h, padded_w = padded_shape
@@ -359,6 +361,7 @@ def run_inference(
     num_workers: int = 4,
     recursive: bool = True,
     mnt_degrees: bool = True,
+    threshold: float = 0.5,
     compile_model: bool = False,
     max_image_dim: int = 1024,
     strategy: str = 'hybrid',
@@ -627,7 +630,8 @@ class InferenceRunner:
                         (padded_h, padded_w), self.config['output_path'], self.config['mnt_degrees'],
                         self.config.get('input_base_path'),
                         self.config.get('quality_mask', False),
-                        self.config.get('unmodulated', False)
+                        self.config.get('unmodulated', False),
+                        self.config.get('threshold', 0.5),
                     )
                     futures.append(future)
 
@@ -669,7 +673,7 @@ class InferenceRunner:
                     batch_tensors = batch_tensors.to(self.device)
                     _qm = self.config.get('quality_mask', False)
                     _um = self.config.get('unmodulated', False)
-                    final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um)
+                    final_outputs = self.model(batch_tensors, minutiae_threshold=self.config.get('threshold', 0.5), quality_mask=_qm, unmodulated=_um)
 
                     # --- ETAPA DE TRANSFERÊNCIA E COLETA (RÁPIDA) ---
                     for i in range(len(batch_paths)):

@@ -78,6 +78,7 @@ def infer_command(args):
     print(f"Batch Size:  {args.batch_size} per GPU")
     print(f"Workers:     {args.cores} per GPU")
     print(f"Recursive:   {args.recursive}")
+    print(f"Threshold:   {args.threshold}")
     print(f"Compile:     {args.compile}")
     print(f"Max Dim:     {args.max_dim}")
     print(f"Strategy:    {args.strategy}")
@@ -96,6 +97,7 @@ def infer_command(args):
         num_workers=args.cores,
         recursive=args.recursive,
         mnt_degrees=args.degrees,
+        threshold=args.threshold,
         compile_model=args.compile,
         max_image_dim=args.max_dim,
         strategy=args.strategy,
@@ -200,6 +202,7 @@ Examples:
         sp.add_argument('-b', '--batch-size', type=int, default=4, help='Batch size per GPU (default: 4)')
         sp.add_argument('--cores', type=int, default=4, help='CPU cores for data loading per GPU (default: 4)')
         sp.add_argument('--recursive', '-r', action='store_true', default=True, help='Search for images recursively in directories (default: on)')
+        sp.add_argument('--threshold', type=float, default=0.5, help='Minutia quality threshold 0–1 (default: 0.5)')
         sp.add_argument('--degrees', action='store_true', default=True, help='Save minutiae angles in degrees instead of radians (default: on)')
         sp.add_argument('--compile', action='store_true', help='Compile model with torch.compile for faster inference (experimental)')
         sp.add_argument('--max-dim', type=int, default=1024, help='Maximum dimension (H or W) for an image before resizing (default: 1024)')

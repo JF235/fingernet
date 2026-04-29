@@ -364,8 +364,18 @@ def _post_nms(minutiae: torch.Tensor, dist_thresh: float = 16.0, angle_thresh: f
     order = torch.argsort(minutiae[:, 3], descending=True)
     minutiae = minutiae[order]
 
-    # Calcula matriz de distância Euclidiana e angular
-    dist_matrix = torch.cdist(minutiae[:, :2], minutiae[:, :2])
+    # Calcula matriz de distância Euclidiana e angular.
+    # Usa a forma direta (a-b)^2 ao invés de torch.cdist; cdist usa o atalho
+    # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a·b, que sob TF32 sofre catastrophic
+    # cancellation para coordenadas em escala de pixel (~10^3): cada termo
+    # tem erro absoluto ~ ||a||^2 * 1e-3, comparável ao próprio resultado
+    # ~16^2 = 256, fazendo a NMS flipar decisões na fronteira do dist_thresh.
+    # A forma elementwise é bit-exata sob TF32 com o mesmo custo (~0.18ms
+    # vs 0.17ms para N=2000 minúcias, contra 6.5ms para
+    # compute_mode='donot_use_mm_for_euclid_dist').
+    xy = minutiae[:, :2]
+    diff = xy.unsqueeze(0) - xy.unsqueeze(1)        # [N, N, 2]
+    dist_matrix = torch.sqrt((diff * diff).sum(-1)) # [N, N]
     
     # Cálculo da distância angular via broadcasting
     angles1 = minutiae[:, 2].unsqueeze(1) # [N, 1]

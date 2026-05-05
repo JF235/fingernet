@@ -211,13 +211,12 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = True, 
     angles_deg_shifted = np.round(np.rad2deg(ori_cpu) + 90).astype(np.uint8)
     Image.fromarray(angles_deg_shifted).save(orientation_path)
 
-    # ----- Opt-in outputs (--quality-mask / --full) ----- #
+    # Continuous quality mask (sigmoid output, per-pixel confidence)
+    quality_path = os.path.join(output_path, "quality", rel_dir, original_filename)
+    os.makedirs(os.path.dirname(quality_path), exist_ok=True)
+    Image.fromarray(result_item["quality"]).save(quality_path)
 
-    # Continuous quality mask (sigmoid)
-    if 'quality_mask' in result_item:
-        qmask_path = os.path.join(output_path, "quality_mask", rel_dir, original_filename)
-        os.makedirs(os.path.dirname(qmask_path), exist_ok=True)
-        Image.fromarray(result_item["quality_mask"]).save(qmask_path)
+    # ----- Opt-in outputs (--full) ----- #
 
     # Modulated enhanced/orientation (multiplied by the mask) — --full only
     if 'enhanced_image_mod' in result_item:
@@ -258,7 +257,6 @@ def postprocess_and_save_batch(
     output_path: str,
     mnt_degrees: bool,
     input_base_path: str = None,
-    quality_mask: bool = False,
     full: bool = False,
     threshold: float = 0.05,
 ):
@@ -268,8 +266,7 @@ def postprocess_and_save_batch(
     logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
         with FnetTimer("Post-processing", logger) as t_post:
-            final_outputs = postprocess(raw_outputs_cpu, threshold=threshold,
-                                        quality_mask=quality_mask, full=full)
+            final_outputs = postprocess(raw_outputs_cpu, threshold=threshold, full=full)
 
         padded_h, padded_w = padded_shape
 
@@ -281,6 +278,7 @@ def postprocess_and_save_batch(
             enhanced_img = final_outputs["enhanced_image"][i][:orig_h, :orig_w].numpy()
             seg_mask = final_outputs["segmentation_mask"][i][:orig_h, :orig_w].numpy()
             ori_field = final_outputs["orientation_field"][i][:orig_h, :orig_w].numpy()
+            quality = final_outputs["quality"][i][:orig_h, :orig_w].numpy()
 
             result_item = {
                 "input_path": batch_paths[i],
@@ -288,10 +286,9 @@ def postprocess_and_save_batch(
                 "enhanced_image": enhanced_img,
                 "segmentation_mask": seg_mask,
                 "orientation_field": ori_field,
+                "quality": quality,
             }
 
-            if quality_mask or full:
-                result_item["quality_mask"] = final_outputs["quality_mask"][i][:orig_h, :orig_w].numpy()
             if full:
                 result_item["enhanced_image_mod"] = final_outputs["enhanced_image_mod"][i][:orig_h, :orig_w].numpy()
                 result_item["orientation_field_mod"] = final_outputs["orientation_field_mod"][i][:orig_h, :orig_w].numpy()
@@ -310,26 +307,25 @@ def postprocess_and_save_batch(
     except Exception as e:
         warnings.warn(f"Post-processing failed for the batch starting at {os.path.basename(batch_paths[0])}. Error: {e}")
 
-def create_output_directories(output_path: str, quality_mask: bool = False, full: bool = False):
+def create_output_directories(output_path: str, full: bool = False):
     """Create the output directory structure.
 
-    Always created: ``minutiae/``, ``mask/``, ``enhanced/``, ``ori/`` —
-    where ``ori/`` holds the orientation field WITHOUT mask modulation and
-    ``enhanced/`` holds the enhanced image WITHOUT mask modulation. These
-    "raw" versions preserve full spatial information.
+    Always created: ``minutiae/``, ``mask/``, ``enhanced/``, ``ori/``,
+    ``quality/``. ``ori/`` holds the orientation field WITHOUT mask
+    modulation and ``enhanced/`` holds the enhanced image WITHOUT mask
+    modulation; the "raw" versions preserve full spatial information.
+    ``quality/`` holds the continuous sigmoid mask (per-pixel
+    confidence).
 
-    Optional:
-        ``quality_mask=True`` → also creates ``quality_mask/``.
-        ``full=True``         → creates ``quality_mask/``, ``enhanced_mod/``,
-                                ``ori_mod/`` (mask-modulated) and
-                                ``minutiae_unmod/`` (without mask filter).
+    Optional (``full=True``):
+        Also creates ``enhanced_mod/``, ``ori_mod/`` (mask-modulated)
+        and ``minutiae_unmod/`` (without the mask filter).
     """
     os.makedirs(os.path.join(output_path, "minutiae"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "mask"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "enhanced"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "ori"), exist_ok=True)
-    if quality_mask or full:
-        os.makedirs(os.path.join(output_path, "quality_mask"), exist_ok=True)
+    os.makedirs(os.path.join(output_path, "quality"), exist_ok=True)
     if full:
         os.makedirs(os.path.join(output_path, "enhanced_mod"), exist_ok=True)
         os.makedirs(os.path.join(output_path, "ori_mod"), exist_ok=True)
@@ -387,7 +383,6 @@ def run_inference(
     max_image_dim: int = 1024,
     strategy: str = 'full_gpu',
     num_cpu_workers: int = 4,
-    quality_mask: bool = False,
     full: bool = False,
 ):
     """
@@ -407,13 +402,13 @@ def run_inference(
         recursive: Search for images recursively
         mnt_degrees: Save minutiae angles in degrees instead of radians
         compile_model: Use torch.compile for faster inference
+        full: also export ``enhanced_mod/``, ``ori_mod/`` (mask-modulated
+            counterparts) and ``minutiae_unmod/`` (minutiae before the
+            mask filter).
 
     Example:
         >>> run_inference('images/', 'output/', gpus=2, batch_size=8)
     """
-    if full:
-        quality_mask = True
-
     image_paths = find_image_paths(input_path, recursive)
 
     # Determine the base path for preserving directory structure
@@ -553,7 +548,6 @@ class InferenceRunner:
             logger.info(f"Setting up runner on device: {self.device}")
             create_output_directories(
                 self.config['output_path'],
-                quality_mask=self.config.get('quality_mask', False),
                 full=self.config.get('full', False),
             )
         
@@ -646,7 +640,6 @@ class InferenceRunner:
                         raw_outputs_cpu, batch_paths, batch_orig_shapes,
                         (padded_h, padded_w), self.config['output_path'], self.config['mnt_degrees'],
                         self.config.get('input_base_path'),
-                        self.config.get('quality_mask', False),
                         self.config.get('full', False),
                         self.config.get('threshold', 0.05),
                     )
@@ -686,12 +679,11 @@ class InferenceRunner:
 
                     # --- GPU STAGE: forward + post-processing ---
                     batch_tensors = batch_tensors.to(self.device, non_blocking=True)
-                    _qm = self.config.get('quality_mask', False)
                     _full = self.config.get('full', False)
                     final_outputs = self.model(
                         batch_tensors,
                         minutiae_threshold=self.config.get('threshold', 0.05),
-                        quality_mask=_qm, full=_full,
+                        full=_full,
                     )
 
                     # --- D2H + COLLECT (cheap) ---
@@ -703,9 +695,8 @@ class InferenceRunner:
                             'enhanced_image': final_outputs['enhanced_image'][i][:orig_h, :orig_w].cpu().numpy(),
                             'segmentation_mask': final_outputs['segmentation_mask'][i][:orig_h, :orig_w].cpu().numpy(),
                             'orientation_field': final_outputs['orientation_field'][i][:orig_h, :orig_w].cpu().numpy(),
+                            'quality': final_outputs['quality'][i][:orig_h, :orig_w].cpu().numpy(),
                         }
-                        if (_qm or _full) and 'quality_mask' in final_outputs:
-                            result_item['quality_mask'] = final_outputs['quality_mask'][i][:orig_h, :orig_w].cpu().numpy()
                         if _full:
                             result_item['enhanced_image_mod'] = final_outputs['enhanced_image_mod'][i][:orig_h, :orig_w].cpu().numpy()
                             result_item['orientation_field_mod'] = final_outputs['orientation_field_mod'][i][:orig_h, :orig_w].cpu().numpy()

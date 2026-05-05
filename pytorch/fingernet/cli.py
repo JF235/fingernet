@@ -83,7 +83,6 @@ def infer_command(args):
     print(f"Max Dim:     {args.max_dim}")
     print(f"Strategy:    {args.strategy}")
     print(f"CPU Workers: {args.cpu_workers}")
-    print(f"Quality Mask:{args.quality_mask}")
     print(f"Full Extr.:  {args.full}")
     print(f"{'='*70}\n")
 
@@ -101,7 +100,6 @@ def infer_command(args):
         max_image_dim=args.max_dim,
         strategy=args.strategy,
         num_cpu_workers=args.cpu_workers,
-        quality_mask=args.quality_mask,
         full=args.full,
     )
 
@@ -206,8 +204,7 @@ Examples:
         sp.add_argument('--max-dim', type=int, default=1024, help='Maximum dimension (H or W) for an image before resizing (default: 1024)')
         sp.add_argument('--strategy',  type=str, default='full_gpu', choices=['hybrid', 'full_gpu'], help="Execution strategy: 'full_gpu' (default, ~4× faster than hybrid on H100) or 'hybrid' (GPU inference, CPU post-processing).")
         sp.add_argument('--cpu-workers', type=int, default=4, help='Number of CPU threads for post-processing in hybrid mode and for saving results (default: 4)')
-        sp.add_argument('--quality-mask', action='store_true', help='Also export the continuous (sigmoid) mask in quality_mask/')
-        sp.add_argument('--full', action='store_true', help='Full extraction: besides the 4 default outputs, also exports enhanced_mod/, ori_mod/, quality_mask/ and minutiae_unmod/')
+        sp.add_argument('--full', action='store_true', help='Full extraction: besides the 5 default outputs, also exports enhanced_mod/, ori_mod/ and minutiae_unmod/')
 
     if any(h in sys.argv for h in ('-h', '--help')) and not any(cmd in sys.argv for cmd in subcommand_names):
         subparsers_temp = parser.add_subparsers(dest='command', required=False, help='Command to execute')

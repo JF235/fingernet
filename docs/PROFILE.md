@@ -92,7 +92,7 @@ produce byte-identical files. We bisected the source.
 |---|---:|
 | enhanced, ori, mask, minutiae | 516 / 516 |
 | enhanced_mod, ori_mod | 516 / 516 |
-| quality_mask, minutiae_unmod | 516 / 516 |
+| quality, minutiae_unmod | 516 / 516 |
 
 → **The new code is 100% deterministic on this machine** (no run-to-run
 drift from TF32, threading, or async D2H ordering).
@@ -121,7 +121,7 @@ regime.
 | `minutiae/`        | **501 (97%)** | —          | 516 |
 | `enhanced_mod/`    | 508 (98%) | +1  → 509 (99%) | 516 |
 | `ori_mod/`         | 510 (99%) | —              | 516 |
-| `quality_mask/`    | 450 (87%) | +66 → 516 (100%) | 516 |
+| `quality/`         | 450 (87%) | +66 → 516 (100%) | 516 |
 | `minutiae_unmod/`  | 500 (97%) | —              | 516 |
 
 For minutiae specifically — out of **102,613 minutiae** in the prior

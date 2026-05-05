@@ -15,20 +15,19 @@ class FingerNetWrapper(nn.Module):
         self.fingernet = model
 
     def forward(self, x: torch.Tensor, minutiae_threshold: float = 0.05,
-                quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+                full: bool = False) -> dict[str, torch.Tensor]:
 
         padded_x = self.preprocess(x)
 
         with torch.inference_mode():
             raw_outputs = self.fingernet(padded_x)
 
-        post_x = self.postprocess(raw_outputs, minutiae_threshold,
-                                  quality_mask=quality_mask, full=full)
+        post_x = self.postprocess(raw_outputs, minutiae_threshold, full=full)
 
         return post_x
 
     def time(self, x: torch.Tensor, minutiae_threshold: float = 0.05,
-             quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+             full: bool = False) -> dict[str, torch.Tensor]:
 
         padded_x = self.preprocess(x)
 
@@ -37,8 +36,7 @@ class FingerNetWrapper(nn.Module):
                 raw_outputs = self.fingernet.time(padded_x)
 
         with FnetTimer("Post-processing", logger):
-            post_x = self.postprocess_time(raw_outputs, minutiae_threshold,
-                                           quality_mask=quality_mask, full=full)
+            post_x = self.postprocess_time(raw_outputs, minutiae_threshold, full=full)
 
         return post_x
 
@@ -72,12 +70,12 @@ class FingerNetWrapper(nn.Module):
         return F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
 
     def postprocess(self, outputs: dict, threshold: float,
-                    quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
-        return postprocess(outputs, threshold, quality_mask=quality_mask, full=full)
+                    full: bool = False) -> dict[str, torch.Tensor]:
+        return postprocess(outputs, threshold, full=full)
 
     def postprocess_time(self, outputs: dict, threshold: float,
-                         quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
-        return postprocess_time(outputs, threshold, quality_mask=quality_mask, full=full)
+                         full: bool = False) -> dict[str, torch.Tensor]:
+        return postprocess_time(outputs, threshold, full=full)
 
 def get_fingernet(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNetWrapper:
     if not os.path.exists(weights_path):
@@ -112,7 +110,7 @@ def _normalize_minmax_to_uint8(x: torch.Tensor) -> torch.Tensor:
 
 
 def postprocess(outputs: dict, threshold: float,
-                quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+                full: bool = False) -> dict[str, torch.Tensor]:
     """Post-process FingerNet raw outputs.
 
     Default outputs (always present):
@@ -121,12 +119,13 @@ def postprocess(outputs: dict, threshold: float,
         - `segmentation_mask`  — binary mask uint8 [0, 255].
         - `orientation_field`  — orientation field WITHOUT mask modulation (rad).
         - `enhanced_image`     — enhanced image WITHOUT mask modulation, uint8 [0, 255].
+        - `quality`            — continuous sigmoid mask uint8 [0, 255]
+                                 (per-pixel "is this fingerprint?" confidence).
 
-    Opt-in extras:
-        - `quality_mask=True`  → adds `quality_mask` (continuous sigmoid).
-        - `full=True`          → adds all the above + modulated versions
-                                 (`*_mod`) and `minutiae_unmod` (without
-                                 mask filter). Implies `quality_mask=True`.
+    Opt-in extra (``full=True``):
+        - Modulated counterparts ``enhanced_image_mod`` and
+          ``orientation_field_mod`` (multiplied by the binary mask).
+        - ``minutiae_unmod`` — minutiae before the mask filter.
     """
     # 1. Binarized + smoothed mask
     cleaned_mask = _post_binarize_mask_fast(outputs['segmentation'])
@@ -154,18 +153,18 @@ def postprocess(outputs: dict, threshold: float,
     enh_real_raw = outputs['enhanced_real'].squeeze(1)
     enhanced_image_raw = _normalize_minmax_to_uint8(enh_real_raw)
 
+    # Continuous segmentation mask (always exported as the quality map)
+    seg_continuous_up = torch.nn.functional.interpolate(
+        outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
+    ).squeeze(1)
+
     result = {
         'minutiae': minutiae_list,
         'enhanced_image': enhanced_image_raw,
         'segmentation_mask': (cleaned_mask_up * 255).byte(),
         'orientation_field': orientation_field_raw,
+        'quality': (seg_continuous_up * 255).byte(),
     }
-
-    if quality_mask or full:
-        seg_continuous_up = torch.nn.functional.interpolate(
-            outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
-        ).squeeze(1)
-        result['quality_mask'] = (seg_continuous_up * 255).byte()
 
     if full:
         result['orientation_field_mod'] = orientation_field_raw * cleaned_mask_up
@@ -178,7 +177,7 @@ def postprocess(outputs: dict, threshold: float,
 
 
 def postprocess_time(outputs: dict, threshold: float,
-                     quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+                     full: bool = False) -> dict[str, torch.Tensor]:
     """Instrumented version of `postprocess` (DEBUG logger)."""
     with FnetTimer("Mask Binarization and Cleaning", logger):
         cleaned_mask = _post_binarize_mask_fast(outputs['segmentation'])
@@ -204,18 +203,17 @@ def postprocess_time(outputs: dict, threshold: float,
         enh_real_raw = outputs['enhanced_real'].squeeze(1)
         enhanced_image_raw = _normalize_minmax_to_uint8(enh_real_raw)
 
+    seg_continuous_up = torch.nn.functional.interpolate(
+        outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
+    ).squeeze(1)
+
     result = {
         'minutiae': minutiae_list,
         'enhanced_image': enhanced_image_raw,
         'segmentation_mask': (cleaned_mask_up * 255).byte(),
         'orientation_field': orientation_field_raw,
+        'quality': (seg_continuous_up * 255).byte(),
     }
-
-    if quality_mask or full:
-        seg_continuous_up = torch.nn.functional.interpolate(
-            outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
-        ).squeeze(1)
-        result['quality_mask'] = (seg_continuous_up * 255).byte()
 
     if full:
         result['orientation_field_mod'] = orientation_field_raw * cleaned_mask_up

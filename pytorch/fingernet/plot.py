@@ -6,54 +6,52 @@ from pathlib import Path
 import glob
 
 def plot_img(ax: plt.Axes, image: np.ndarray):
-    """Plota a imagem em um determinado eixo."""
+    """Plot the image on the given axis."""
     ax.imshow(image, cmap='gray')
     ax.set_xticks([])
     ax.set_yticks([])
 
 def plot_ori_field(ax: plt.Axes, orientation_field: np.ndarray, stride: int = 16):
-    """
-    Sobrepõe o campo de orientação (segmentos) em um determinado eixo.
+    """Overlay the orientation field (segments) on the given axis.
 
     Args:
-        ax: O eixo do Matplotlib para desenhar.
-        orientation_field: O array 2D com os ângulos em radianos.
-        stride: O espaçamento entre os segmentos de orientação.
+        ax: Matplotlib axis to draw onto.
+        orientation_field: 2-D array of angles in radians.
+        stride: Spacing between orientation segments.
     """
     height, width = orientation_field.shape
-    # O comprimento do segmento é proporcional ao stride para uma boa visualização
-    segment_length = stride * 0.45 
-    
+    # Segment length scaled with stride for legibility
+    segment_length = stride * 0.45
+
     for r in range(stride // 2, height, stride):
         for c in range(stride // 2, width, stride):
             angle = orientation_field[r, c]
-            # Ignora pontos sem orientação definida (onde o ângulo é 0 no background)
+            # Skip points with no defined orientation (background where angle = 0)
             if angle != 0:
                 dx = segment_length * np.cos(angle)
                 dy = segment_length * np.sin(angle)
-                # Desenha uma linha do ponto (c, r) na direção do ângulo
+                # Draw a line through (c, r) along the angle direction
                 ax.plot([c - dx, c + dx], [r - dy, r + dy], 'r-', linewidth=1)
 
 def plot_mnt(ax: plt.Axes, minutiae: np.ndarray, r: int = 10):
-    """
-    Sobrepõe as minúcias (quadrados e ângulos) em um determinado eixo.
+    """Overlay minutiae (squares + angles) on the given axis.
 
     Args:
-        ax: O eixo do Matplotlib para desenhar.
-        minutiae: Array (N, 4) com colunas [x, y, ângulo, score].
-        r: O comprimento do segmento que indica o ângulo da minúcia.
+        ax: Matplotlib axis to draw onto.
+        minutiae: (N, 4) array with columns [x, y, angle, score].
+        r: Segment length that indicates each minutia's angle.
     """
-    # Plota quadrados vermelhos sem preenchimento nas posições (x, y)
+    # Red unfilled squares at (x, y)
     ax.plot(
-        minutiae[:, 0], 
-        minutiae[:, 1], 
-        'rs',  # 'r' para vermelho, 's' para quadrado (square)
-        fillstyle='none', 
-        markersize=6, 
+        minutiae[:, 0],
+        minutiae[:, 1],
+        'rs',  # 'r' for red, 's' for square
+        fillstyle='none',
+        markersize=6,
         markeredgewidth=1
     )
-    
-    # Desenha os segmentos de orientação para cada minúcia
+
+    # Draw the orientation segment for each minutia
     for x, y, angle, score in minutiae:
         ax.plot([x, x + r * np.cos(angle)], [y, y + r * np.sin(angle)], 'r-', linewidth=1.5)
 
@@ -72,34 +70,35 @@ def plot_raw_output(
     else:
         input_image = orig_img
 
-    # Cria a figura e a grade de subplots 1x4
+    # 1x4 subplot grid
     fig, axes = plt.subplots(1, 4, figsize=figsize)
-    
-    # --- Subplot 1 (Primeira Coluna) ---
+
+    # --- Subplot 1 ---
     ax1 = axes[0]
     plot_img(ax1, orientation_field)
-    ax1.set_title("Campo de Orientação")
+    ax1.set_title("Orientation Field")
 
-    # --- Subplot 2 (Segunda Coluna) ---
+    # --- Subplot 2 ---
     ax2 = axes[1]
     plot_img(ax2, enhanced_image)
-    ax2.set_title("Imagem Melhorada")
+    ax2.set_title("Enhanced Image")
 
-    # --- Subplot 3 (Terceira Coluna) ---
+    # --- Subplot 3 ---
     ax3 = axes[2]
     plot_img(ax3, input_image)
     plot_ori_field(ax3, orientation_field, stride=stride)
-    ax3.set_title(f"Campo de Orientação (Stride: {stride})")
-    
-    # --- Subplot 4 (Quarta Coluna) ---
+    ax3.set_title(f"Orientation Field (Stride: {stride})")
+
+    # --- Subplot 4 ---
     ax4 = axes[3]
     plot_img(ax4, input_image)
     plot_mnt(ax4, minutiae)
-    ax4.set_title(f"Minúcias Detectadas ({len(minutiae)})")
+    ax4.set_title(f"Detected Minutiae ({len(minutiae)})")
 
-    # Ajusta o layout para evitar sobreposição de títulos
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Ajusta para o suptitle 
-    
+    # Avoid title overlap
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+
 
 def plot_output(
     result: dict,
@@ -107,68 +106,65 @@ def plot_output(
     stride: int = 16,
     figsize: tuple = (20, 6)
 ):
-    """
-    Gera uma figura 2x2 com a visualização completa dos resultados da inferência.
+    """Render a 1x4 figure with the full visualization of inference results.
 
     Args:
-        result (dict): Um único dicionário da lista de resultados de `run_inference`.
-                       Deve conter as chaves 'input_path', 'orientation_field', etc.
-        save_path (str | None): Caminho para salvar a figura. Se None, a figura é exibida.
-        stride (int): O stride para a visualização do campo de orientação.
+        result (dict): A single dict from the result list returned by
+            ``run_inference``. Must contain ``input_path``,
+            ``orientation_field``, ``enhanced_image`` and ``minutiae``.
+        save_path (str | None): Path to save the figure. If None, displays.
+        stride (int): Stride for the orientation-field visualization.
     """
     try:
-        # Carrega a imagem de entrada original para sobreposição
+        # Load the original input image for overlays
         input_image = np.array(Image.open(result['input_path']).convert('L'))
     except FileNotFoundError:
-        print(f"Erro: Imagem de entrada não encontrada em {result['input_path']}")
+        print(f"Error: input image not found at {result['input_path']}")
         return
 
-    # Extrai os dados do dicionário de resultados
+    # Pull data from the result dict
     orientation_field = result['orientation_field'].squeeze()
     enhanced_image = result['enhanced_image'].squeeze()
     minutiae = result['minutiae'][0]
 
-    # Cria a figura e a grade de subplots 1x4
+    # 1x4 subplot grid
     fig, axes = plt.subplots(1, 4, figsize=figsize)
-    
-    # --- Subplot 1 (Primeira Coluna) ---
+
+    # --- Subplot 1 ---
     ax1 = axes[0]
     plot_img(ax1, orientation_field)
-    ax1.set_title("Campo de Orientação")
+    ax1.set_title("Orientation Field")
 
-    # --- Subplot 2 (Segunda Coluna) ---
+    # --- Subplot 2 ---
     ax2 = axes[1]
     plot_img(ax2, enhanced_image)
-    ax2.set_title("Imagem Melhorada")
+    ax2.set_title("Enhanced Image")
 
-    # --- Subplot 3 (Terceira Coluna) ---
+    # --- Subplot 3 ---
     ax3 = axes[2]
     plot_img(ax3, input_image)
     plot_ori_field(ax3, orientation_field, stride=stride)
-    ax3.set_title(f"Campo de Orientação (Stride: {stride})")
-    
-    # --- Subplot 4 (Quarta Coluna) ---
+    ax3.set_title(f"Orientation Field (Stride: {stride})")
+
+    # --- Subplot 4 ---
     ax4 = axes[3]
     plot_img(ax4, input_image)
     plot_mnt(ax4, minutiae)
-    ax4.set_title(f"Minúcias Detectadas ({len(minutiae)})")
+    ax4.set_title(f"Detected Minutiae ({len(minutiae)})")
 
-    # Define um título geral para a figura
+    # Figure-wide title
     base_name = os.path.basename(result['input_path'])
-    fig.suptitle(f"Resultados da FingerNet para: {base_name}", fontsize=16)
+    fig.suptitle(f"FingerNet results for: {base_name}", fontsize=16)
 
-    # Ajusta o layout para evitar sobreposição de títulos
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Ajusta para o suptitle
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    # Salva ou exibe a figura
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path)
-        print(f"📈 Visualização salva em: {save_path}")
+        print(f"Visualization saved to: {save_path}")
     else:
         plt.show()
-    
-    # Fecha a figura para liberar memória
+
     plt.close(fig)
 
 
@@ -180,24 +176,23 @@ def plot_from_output_folder(
     degrees: bool = False,
     input_path: str | None = None,
 ):
-    """
-    Plota os resultados da inferência a partir da nova estrutura de pastas,
-    reconstruindo os caminhos para uma imagem específica.
+    """Plot inference results from the on-disk output folder structure,
+    reconstructing the file paths for a specific image.
 
     Args:
-        output_path (str): Caminho para a pasta principal de resultados (ex: 'output/').
-        image_filename (str): Nome do arquivo da imagem original (ex: '101_1.png').
-        save_path (str | None): Caminho para salvar a figura. Se None, exibe na tela.
-        stride (int): Stride para visualização do campo de orientação.
+        output_path (str): Path to the top-level results folder (e.g. 'output/').
+        image_filename (str): Original image filename (e.g. '101_1.png').
+        save_path (str | None): Path to save the figure. If None, displays.
+        stride (int): Stride for the orientation-field visualization.
     """
-    print(f"INFO: Gerando visualização para '{image_filename}' a partir de '{output_path}'...")
+    print(f"INFO: Generating visualization for '{image_filename}' from '{output_path}'...")
 
-    # Use apenas o basename do nome do ficheiro fornecido pelo usuário.
-    # Isso permite que o usuário passe tanto '100_1.png' quanto 'enhanced/100_1.png'.
+    # Use only the basename of whatever the user passed.
+    # This way they can pass either '100_1.png' or 'enhanced/100_1.png'.
     image_basename = os.path.basename(image_filename)
     base_name = Path(image_basename).stem
 
-    # --- Reconstrói os caminhos dos arquivos com base na nova estrutura ---
+    # --- Reconstruct artifact paths based on the output folder layout ---
     # Candidate directory name patterns for each artifact group.
     enhanced_dirs = ['enh*']
     orientation_dirs = ['ori*', 'orientation*']
@@ -226,16 +221,16 @@ def plot_from_output_folder(
     orientation_path = find_file_by_dir_patterns(output_path, orientation_dirs, image_basename)
     minutiae_path = find_file_by_dir_patterns(output_path, minutiae_dirs, f"{base_name}.min")
 
-    # Verifica se todos os arquivos necessários existem
+    # Make sure all required files exist
     for name, path in (('enhanced', enhanced_path), ('orientation', orientation_path), ('minutiae', minutiae_path)):
         if path is None:
-            print(f"ERRO: Não foi possível localizar o arquivo {name} para '{image_basename}' dentro de '{output_path}'.")
+            print(f"ERROR: could not locate the {name} file for '{image_basename}' under '{output_path}'.")
             return
         if not os.path.exists(path):
-            print(f"ERRO: Arquivo necessário não encontrado: {path}")
+            print(f"ERROR: required file not found: {path}")
             return
 
-    # Carrega os dados dos arquivos
+    # Load file data
     if input_path is not None:
         display_image = np.array(Image.open(input_path).convert('L'))
     else:
@@ -245,42 +240,41 @@ def plot_from_output_folder(
     orientation_field = np.deg2rad(orientation_img.astype(np.float32) - 90.0)
 
     minutiae = np.loadtxt(minutiae_path, comments='#')
-    if minutiae.ndim == 1 and minutiae.size > 0: # Garante que funcione para uma única minúcia
+    if minutiae.ndim == 1 and minutiae.size > 0:  # handle single-minutia case
         minutiae = np.expand_dims(minutiae, 0)
-    elif minutiae.size == 0: # Lida com o caso de nenhuma minúcia encontrada
+    elif minutiae.size == 0:  # handle no-minutiae case
         minutiae = np.empty((0, 4))
 
-    # Converte ângulo do padrão .min (CCW graus) para radianos CW (para plotagem em coords de tela)
+    # Convert .min angles (CCW degrees) to CW radians (matplotlib screen coords)
     minutiae[:, 2] = (-np.deg2rad(minutiae[:, 2])) % (2 * np.pi)
 
-    # --- Cria a figura com 3 subplots (lógica de plotagem inalterada) ---
+    # --- 3-subplot figure (plotting logic unchanged) ---
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-    # 1. Imagem
+    # 1. Image
     plot_img(axes[0], display_image)
-    axes[0].set_title("Imagem Original" if input_path is not None else "Imagem Melhorada")
+    axes[0].set_title("Original Image" if input_path is not None else "Enhanced Image")
 
-    # 2. Imagem + campo de orientação
+    # 2. Image + orientation field
     plot_img(axes[1], display_image)
     plot_ori_field(axes[1], orientation_field, stride=stride)
-    axes[1].set_title(f"Campo de Orientação (Stride: {stride})")
+    axes[1].set_title(f"Orientation Field (Stride: {stride})")
 
-    # 3. Imagem + minúcias
+    # 3. Image + minutiae
     plot_img(axes[2], display_image)
     plot_mnt(axes[2], minutiae)
-    axes[2].set_title(f"Minúcias Detectadas ({len(minutiae)})")
+    axes[2].set_title(f"Detected Minutiae ({len(minutiae)})")
 
-    # Título geral e salvamento
-    fig.suptitle(f"Resultados FingerNet para: {image_filename}", fontsize=16)
+    # Figure title + save
+    fig.suptitle(f"FingerNet results for: {image_filename}", fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     if save_path:
-        # Garante que o diretório de destino para a imagem de plotagem exista
         plt.savefig(save_path)
-        print(f"📈 Visualização salva em: {save_path}")
+        print(f"Visualization saved to: {save_path}")
     else:
-        # plt.show() pode causar erros em ambientes sem GUI
-        print("AVISO: save_path não fornecido. A plotagem não será exibida em ambientes sem GUI.")
-        # plt.show() 
-    
+        # plt.show() can fail in headless environments
+        print("WARNING: no save_path given. Plot will not be shown in headless environments.")
+        # plt.show()
+
     plt.close(fig)

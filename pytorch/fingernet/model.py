@@ -21,7 +21,7 @@ class ImgNormalization(nn.Module):
         return torch.where(x > m, self.m0 + after, self.m0 - after)
 
 class ConvBNPReLU(nn.Module):
-    """Convolução -> BatchNorm -> PReLU."""
+    """Conv -> BatchNorm -> PReLU."""
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1):
         super().__init__()
         padding = dilation * (kernel_size - 1) // 2
@@ -39,7 +39,7 @@ class ConvBNPReLU(nn.Module):
         return x
 
 class FeatureExtractor(nn.Module):
-    """Extrai características da imagem de entrada (Backbone VGG)."""
+    """Extracts features from the input image (VGG-style backbone)."""
     def __init__(self):
         super().__init__()
         self.conv1_1 = ConvBNPReLU(1, 64, 3)
@@ -60,7 +60,7 @@ class FeatureExtractor(nn.Module):
         return self.pool3(x)
 
 class OrientationSegmentationHead(nn.Module):
-    """Prediz orientação e segmentação a partir das características (ASPP)."""
+    """Predicts orientation and segmentation from features (ASPP)."""
     def __init__(self):
         super().__init__()
         self.atrous_1 = ConvBNPReLU(256, 256, 3, dilation=1)
@@ -82,13 +82,13 @@ class OrientationSegmentationHead(nn.Module):
         return ori_out, seg_out
 
 class EnhancementModule(nn.Module):
-    """Realça a imagem usando filtros de Gabor e a orientação prevista."""
+    """Enhance the image with Gabor filters and the predicted orientation."""
     def __init__(self):
         super().__init__()
         self.gabor_real = nn.Conv2d(1, 90, 25, padding='same', bias=True)
         self.gabor_imag = nn.Conv2d(1, 90, 25, padding='same', bias=True)
 
-        # Pré-calcula o kernel gaussiano circular como tensor PyTorch
+        # Precompute the circular Gaussian kernel as a PyTorch tensor
         length = 180
         stride = 2
         std = 3
@@ -98,14 +98,13 @@ class EnhancementModule(nn.Module):
         delta = np.array(np.abs(label - y), dtype=int)
         delta = np.minimum(delta, length - delta) + length // 2
         glabel = gaussian_pdf[delta].astype(np.float32)
-        # Salva como buffer para garantir que move junto com o módulo para o device
+        # Stored as a buffer so it follows the module across .to(device)
         self.register_buffer('glabel_tensor', torch.from_numpy(glabel).permute(2, 3, 0, 1))
 
     def _ori_highest_peak(self, y_pred, length=180, stride=2):
-        """
-        Aplica uma convolução 2D entre a predição y_pred e um kernel gaussiano circular,
-        para detectar o pico de orientação dominante em dados angulares (ex: impressões digitais).
-        O kernel é construído considerando a periodicidade dos ângulos (0-180 graus).
+        """Convolve y_pred with a circular Gaussian kernel to find the dominant
+        orientation peak in angular data (e.g. fingerprints). The kernel is
+        built to respect the periodicity of angles (0-180 degrees).
         """
         return F.conv2d(y_pred, self.glabel_tensor, padding='same')
 
@@ -131,7 +130,7 @@ class EnhancementModule(nn.Module):
         filtered_real = self.gabor_real(original_image)
         filtered_imag = self.gabor_imag(original_image)
 
-        # Encontra o pico de orientação mais alto e seleciona a orientação máxima
+        # Find the highest orientation peak and select the dominant orientation
         ori_map = self._ori_highest_peak(ori_map)
         ori_peak = self._select_max_orientation(ori_map)
         upsampled_ori = F.interpolate(ori_peak, scale_factor=8, mode='nearest')
@@ -143,7 +142,7 @@ class EnhancementModule(nn.Module):
         return enh_real, enhanced_phase, upsampled_ori
 
 class MinutiaeHead(nn.Module):
-    """Bloco 4: Prediz os atributos das minúcias a partir da imagem realçada."""
+    """Block 4: predicts minutiae attributes from the enhanced image."""
     def __init__(self):
         super().__init__()
         self.conv1 = ConvBNPReLU(2, 64, 9); self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
@@ -167,7 +166,7 @@ class MinutiaeHead(nn.Module):
         return mnt_o, mnt_w, mnt_h, mnt_s
 
 class FingerNet(nn.Module):
-    """Modelo FingerNet completo, orquestrando a passagem de dados entre os blocos."""
+    """Complete FingerNet model — orchestrates the data flow across blocks."""
     def __init__(self):
         super().__init__()
         self.img_norm = ImgNormalization()
@@ -177,7 +176,7 @@ class FingerNet(nn.Module):
         self.minutiae_head = MinutiaeHead()
 
     def segment(self, x: torch.Tensor) -> torch.Tensor:
-        """Retorna apenas o mapa de segmentação."""
+        """Return only the segmentation map."""
         x_norm = self.img_norm(x)
         features = self.feature_extractor(x_norm)
         _, seg_map = self.ori_seg_head(features)
@@ -185,7 +184,7 @@ class FingerNet(nn.Module):
         return upsampled_seg
 
     def enhance(self, x: torch.Tensor) -> torch.Tensor:
-        """Retorna apenas a imagem realçada."""
+        """Return only the enhanced image."""
         x_norm = self.img_norm(x)
         features = self.feature_extractor(x_norm)
         ori_map, _ = self.ori_seg_head(features)
@@ -193,8 +192,8 @@ class FingerNet(nn.Module):
         return enh_real
 
     def forward(self, x: torch.Tensor):
-        """Define o fluxo de dados e retorna um dicionário com todas as saídas."""
-        # Etapas do pipeline
+        """Define the data flow and return a dict with all outputs."""
+        # Pipeline stages
         x_norm = self.img_norm(x)
         features = self.feature_extractor(x_norm)
 
@@ -209,7 +208,7 @@ class FingerNet(nn.Module):
         
         mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
 
-        # Retorna um dicionário com saídas nomeadas para clareza
+        # Return a dict with named outputs for clarity
         return {
             'orientation upsample': upsampled_ori_map,
             'segmentation upsample': upsampled_seg_out,
@@ -224,9 +223,9 @@ class FingerNet(nn.Module):
         }
 
     def time(self, x: torch.Tensor):
-        """Define o fluxo de dados e retorna um dicionário com todas as saídas."""
-        # Etapas do pipeline
-        
+        """Define the data flow and return a dict with all outputs."""
+        # Pipeline stages
+
         x_norm = self.img_norm(x)
 
         with FnetTimer("Feature Extraction", logger):
@@ -246,7 +245,7 @@ class FingerNet(nn.Module):
         with FnetTimer("Minutiae Head", logger):
             mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
 
-        # Retorna um dicionário com saídas nomeadas para clareza
+        # Return a dict with named outputs for clarity
         return {
             'orientation upsample': upsampled_ori_map,
             'segmentation upsample': upsampled_seg_out,

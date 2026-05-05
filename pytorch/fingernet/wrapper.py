@@ -14,21 +14,21 @@ class FingerNetWrapper(nn.Module):
         super().__init__()
         self.fingernet = model
 
-    def forward(self, x: torch.Tensor, minutiae_threshold: float = 0.5,
-                quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, minutiae_threshold: float = 0.05,
+                quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
 
         padded_x = self.preprocess(x)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             raw_outputs = self.fingernet(padded_x)
 
         post_x = self.postprocess(raw_outputs, minutiae_threshold,
-                                  quality_mask=quality_mask, unmodulated=unmodulated)
+                                  quality_mask=quality_mask, full=full)
 
         return post_x
 
-    def time(self, x: torch.Tensor, minutiae_threshold: float = 0.5,
-             quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
+    def time(self, x: torch.Tensor, minutiae_threshold: float = 0.05,
+             quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
 
         padded_x = self.preprocess(x)
 
@@ -38,7 +38,7 @@ class FingerNetWrapper(nn.Module):
 
         with FnetTimer("Post-processing", logger):
             post_x = self.postprocess_time(raw_outputs, minutiae_threshold,
-                                           quality_mask=quality_mask, unmodulated=unmodulated)
+                                           quality_mask=quality_mask, full=full)
 
         return post_x
 
@@ -72,12 +72,12 @@ class FingerNetWrapper(nn.Module):
         return F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
 
     def postprocess(self, outputs: dict, threshold: float,
-                    quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
-        return postprocess(outputs, threshold, quality_mask=quality_mask, unmodulated=unmodulated)
+                    quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+        return postprocess(outputs, threshold, quality_mask=quality_mask, full=full)
 
     def postprocess_time(self, outputs: dict, threshold: float,
-                         quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
-        return postprocess_time(outputs, threshold, quality_mask=quality_mask, unmodulated=unmodulated)
+                         quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+        return postprocess_time(outputs, threshold, quality_mask=quality_mask, full=full)
 
 def get_fingernet(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNetWrapper:
     if not os.path.exists(weights_path):
@@ -101,9 +101,34 @@ def get_fingernet(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAUL
     
     return fnet_wrapper
 
+def _normalize_minmax_to_uint8(x: torch.Tensor) -> torch.Tensor:
+    """Min-max normalize per image in the batch, return uint8 in [0, 255]."""
+    b, h, w = x.shape
+    flat = x.view(b, -1)
+    mn = flat.min(dim=1, keepdim=True)[0]
+    mx = flat.max(dim=1, keepdim=True)[0]
+    norm = (flat - mn) / (mx - mn + 1e-8)
+    return (norm.view(b, h, w) * 255).byte()
+
+
 def postprocess(outputs: dict, threshold: float,
-                quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
-    # 1. Binarização e limpeza da máscara de segmentação
+                quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+    """Post-process FingerNet raw outputs.
+
+    Default outputs (always present):
+        - `minutiae`           — list[B] of [N, 4] (x, y, angle rad, score),
+                                 already filtered by the mask and with NMS.
+        - `segmentation_mask`  — binary mask uint8 [0, 255].
+        - `orientation_field`  — orientation field WITHOUT mask modulation (rad).
+        - `enhanced_image`     — enhanced image WITHOUT mask modulation, uint8 [0, 255].
+
+    Opt-in extras:
+        - `quality_mask=True`  → adds `quality_mask` (continuous sigmoid).
+        - `full=True`          → adds all the above + modulated versions
+                                 (`*_mod`) and `minutiae_unmod` (without
+                                 mask filter). Implies `quality_mask=True`.
+    """
+    # 1. Binarized + smoothed mask
     cleaned_mask = _post_binarize_mask_fast(outputs['segmentation'])
     cleaned_mask_up = torch.nn.functional.interpolate(
         cleaned_mask.unsqueeze(1).float(),
@@ -111,138 +136,102 @@ def postprocess(outputs: dict, threshold: float,
         mode='nearest'
     ).squeeze(1)
 
-    # 2. Detecção de minúcias (incluindo NMS)
-    if unmodulated:
-        final_minutiae_list, final_minutiae_unmod_list = _post_detect_minutiae(
+    # 2. Minutiae (always the mask-filtered ones; minutiae_unmod only if full=True)
+    if full:
+        minutiae_list, minutiae_unmod_list = _post_detect_minutiae(
             outputs, cleaned_mask, threshold, unmodulated=True)
     else:
-        final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
+        minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
 
-    # 3. Processamento do campo de orientação
-    ori = outputs['orientation']
-    ori_idx = torch.argmax(ori, dim=1)
+    # 3. Orientation field (raw / unmodulated by default)
+    ori_idx = torch.argmax(outputs['orientation'], dim=1)
     ori_idx_up = torch.nn.functional.interpolate(
-        ori_idx.unsqueeze(1).float(),
-        scale_factor=8,
-        mode='nearest'
+        ori_idx.unsqueeze(1).float(), scale_factor=8, mode='nearest'
     ).squeeze(1)
     orientation_field_raw = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
-    orientation_field = orientation_field_raw * cleaned_mask_up
 
-    # 4. Processamento da imagem melhorada
-    enh_real = outputs['enhanced_real'].squeeze(1)
-    enh_real_raw = enh_real  # referência antes da modulação
-    enh_real = enh_real * cleaned_mask_up
-
-    # Normalização Min-Max para visualização
-    b, h, w = enh_real.shape
-    enh_flat = enh_real.view(b, -1)
-    enh_min = enh_flat.min(dim=1, keepdim=True)[0]
-    enh_max = enh_flat.max(dim=1, keepdim=True)[0]
-    enh_norm = (enh_flat - enh_min) / (enh_max - enh_min + 1e-8)
-    enh_visual = (enh_norm.view(b, h, w) * 255).byte()
+    # 4. Enhanced image (raw / unmodulated by default)
+    enh_real_raw = outputs['enhanced_real'].squeeze(1)
+    enhanced_image_raw = _normalize_minmax_to_uint8(enh_real_raw)
 
     result = {
-        'minutiae': final_minutiae_list,
-        'enhanced_image': enh_visual,
+        'minutiae': minutiae_list,
+        'enhanced_image': enhanced_image_raw,
         'segmentation_mask': (cleaned_mask_up * 255).byte(),
-        'orientation_field': orientation_field
+        'orientation_field': orientation_field_raw,
     }
 
-    if quality_mask:
+    if quality_mask or full:
         seg_continuous_up = torch.nn.functional.interpolate(
             outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
         ).squeeze(1)
         result['quality_mask'] = (seg_continuous_up * 255).byte()
 
-    if unmodulated:
-        result['orientation_field_unmod'] = orientation_field_raw
-        result['minutiae_unmod'] = final_minutiae_unmod_list
-        # Enhanced não-modulado normalizado
-        enh_flat_raw = enh_real_raw.view(b, -1)
-        enh_min_raw = enh_flat_raw.min(dim=1, keepdim=True)[0]
-        enh_max_raw = enh_flat_raw.max(dim=1, keepdim=True)[0]
-        enh_norm_raw = (enh_flat_raw - enh_min_raw) / (enh_max_raw - enh_min_raw + 1e-8)
-        result['enhanced_image_unmod'] = (enh_norm_raw.view(b, h, w) * 255).byte()
+    if full:
+        result['orientation_field_mod'] = orientation_field_raw * cleaned_mask_up
+        result['enhanced_image_mod'] = _normalize_minmax_to_uint8(
+            enh_real_raw * cleaned_mask_up
+        )
+        result['minutiae_unmod'] = minutiae_unmod_list
 
     return result
 
+
 def postprocess_time(outputs: dict, threshold: float,
-                     quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
-    # 1. Binarização e limpeza da máscara de segmentação
+                     quality_mask: bool = False, full: bool = False) -> dict[str, torch.Tensor]:
+    """Instrumented version of `postprocess` (DEBUG logger)."""
     with FnetTimer("Mask Binarization and Cleaning", logger):
         cleaned_mask = _post_binarize_mask_fast(outputs['segmentation'])
         cleaned_mask_up = torch.nn.functional.interpolate(
-            cleaned_mask.unsqueeze(1).float(),
-            scale_factor=8,
-            mode='nearest'
+            cleaned_mask.unsqueeze(1).float(), scale_factor=8, mode='nearest'
         ).squeeze(1)
 
-    # 2. Detecção de minúcias (incluindo NMS)
     with FnetTimer("Minutiae Detection", logger):
-        if unmodulated:
-            final_minutiae_list, final_minutiae_unmod_list = _post_detect_minutiae(
+        if full:
+            minutiae_list, minutiae_unmod_list = _post_detect_minutiae(
                 outputs, cleaned_mask, threshold, unmodulated=True)
         else:
-            final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
+            minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
 
-    # 3. Processamento do campo de orientação
     with FnetTimer("Orientation Field Processing", logger):
-        ori = outputs['orientation']
-        ori_idx = torch.argmax(ori, dim=1)
+        ori_idx = torch.argmax(outputs['orientation'], dim=1)
         ori_idx_up = torch.nn.functional.interpolate(
-            ori_idx.unsqueeze(1).float(),
-            scale_factor=8,
-            mode='nearest'
+            ori_idx.unsqueeze(1).float(), scale_factor=8, mode='nearest'
         ).squeeze(1)
         orientation_field_raw = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
-        orientation_field = orientation_field_raw * cleaned_mask_up
 
-    # 4. Processamento da imagem melhorada
-    with FnetTimer("Enhanced Image Processing", logger):
-        enh_real = outputs['enhanced_real'].squeeze(1)
-        enh_real_raw = enh_real
-        enh_real = enh_real * cleaned_mask_up
-
-    # Normalização Min-Max para visualização
     with FnetTimer("Enhanced Image Normalization", logger):
-        b, h, w = enh_real.shape
-        enh_flat = enh_real.view(b, -1)
-        enh_min = enh_flat.min(dim=1, keepdim=True)[0]
-        enh_max = enh_flat.max(dim=1, keepdim=True)[0]
-        enh_norm = (enh_flat - enh_min) / (enh_max - enh_min + 1e-8)
-        enh_visual = (enh_norm.view(b, h, w) * 255).byte()
+        enh_real_raw = outputs['enhanced_real'].squeeze(1)
+        enhanced_image_raw = _normalize_minmax_to_uint8(enh_real_raw)
 
     result = {
-        'minutiae': final_minutiae_list,
-        'enhanced_image': enh_visual,
+        'minutiae': minutiae_list,
+        'enhanced_image': enhanced_image_raw,
         'segmentation_mask': (cleaned_mask_up * 255).byte(),
-        'orientation_field': orientation_field
+        'orientation_field': orientation_field_raw,
     }
 
-    if quality_mask:
+    if quality_mask or full:
         seg_continuous_up = torch.nn.functional.interpolate(
             outputs['segmentation'], scale_factor=8, mode='bilinear', align_corners=False
         ).squeeze(1)
         result['quality_mask'] = (seg_continuous_up * 255).byte()
 
-    if unmodulated:
-        result['orientation_field_unmod'] = orientation_field_raw
-        result['minutiae_unmod'] = final_minutiae_unmod_list
-        enh_flat_raw = enh_real_raw.view(b, -1)
-        enh_min_raw = enh_flat_raw.min(dim=1, keepdim=True)[0]
-        enh_max_raw = enh_flat_raw.max(dim=1, keepdim=True)[0]
-        enh_norm_raw = (enh_flat_raw - enh_min_raw) / (enh_max_raw - enh_min_raw + 1e-8)
-        result['enhanced_image_unmod'] = (enh_norm_raw.view(b, h, w) * 255).byte()
+    if full:
+        result['orientation_field_mod'] = orientation_field_raw * cleaned_mask_up
+        result['enhanced_image_mod'] = _normalize_minmax_to_uint8(
+            enh_real_raw * cleaned_mask_up
+        )
+        result['minutiae_unmod'] = minutiae_unmod_list
 
     return result
 
 
 def _post_binarize_mask(self, seg_map: torch.Tensor) -> torch.Tensor:
-    """Binariza e limpa a máscara de segmentação usando Kornia."""
+    """Binarize and clean the segmentation mask using Kornia."""
     seg_map_squeezed = seg_map.squeeze(1)
     binarized = torch.round(seg_map_squeezed).bool()
-    # # Kornia espera um shape [B, C, H, W], por isso o unsqueeze/squeeze
+    # Kornia expects shape [B, C, H, W], hence the unsqueeze/squeeze.
     kernel = torch.ones(5, 5, device=seg_map.device)
     cleaned = kornia.morphology.opening(binarized.unsqueeze(1), kernel).squeeze(1)
     return cleaned
@@ -251,60 +240,56 @@ def gaussian_blur_torch(image: torch.Tensor, kernel_size: int, sigma: float) -> 
     def _get_gaussian_kernel1d(kernel_size: int, sigma: float, device, dtype) -> torch.Tensor:
         coords = torch.arange(kernel_size, device=device, dtype=dtype)
         coords -= kernel_size // 2
-        # avoid using tensor ** operations (pow) which can trigger symbolic
-        # interpretation inside torch.compile / torch._dynamo (sympy interp)
+        # Avoid tensor ** (pow), which can trigger symbolic interpretation
+        # inside torch.compile / torch._dynamo (sympy interp).
         coords_sq = coords * coords
         sigma_sq = sigma * sigma
         g = torch.exp(-(coords_sq) / (2 * sigma_sq))
         g /= g.sum()
         return g
-    
-    # 1. Obter o kernel 1D
+
+    # 1. Build the 1-D kernel
     kernel_1d = _get_gaussian_kernel1d(kernel_size, sigma, device=image.device, dtype=image.dtype)
-    
-    # 2. Obter o número de canais para aplicar o blur em cada um independentemente
+
+    # 2. Number of channels (each channel is blurred independently)
     B, C, H, W = image.shape
-    
-    # 3. Preparar kernels para convolução horizontal e vertical
-    # A conv2d espera um shape [out_channels, in_channels/groups, kH, kW]
-    # Usamos `groups=C` para que cada canal seja convolvido com seu próprio kernel.
+
+    # 3. Build horizontal/vertical conv kernels.
+    # conv2d expects [out_channels, in_channels/groups, kH, kW]. We use
+    # groups=C so that every channel is convolved with its own kernel.
     kernel_h = kernel_1d.view(1, 1, 1, kernel_size).repeat(C, 1, 1, 1)
     kernel_v = kernel_1d.view(1, 1, kernel_size, 1).repeat(C, 1, 1, 1)
 
-    # 4. Calcular o padding para manter o tamanho da imagem
+    # 4. Padding to keep the spatial size constant
     padding = kernel_size // 2
-    
-    # 5. Aplicar a convolução horizontal
+
+    # 5. Horizontal pass
     blurred_h = F.conv2d(image, kernel_h, padding=(0, padding), groups=C)
-    
-    # 6. Aplicar a convolução vertical no resultado da horizontal
+
+    # 6. Vertical pass on the horizontal result
     blurred_hv = F.conv2d(blurred_h, kernel_v, padding=(padding, 0), groups=C)
-    
+
     return blurred_hv
 
 def _post_binarize_mask_fast(seg_map: torch.Tensor) -> torch.Tensor:
-    """
-    Binariza e limpa a máscara de segmentação de forma extremamente rápida,
-    usando uma implementação de blur Gaussiano apenas com PyTorch.
-    """
-    # 1. Binariza a máscara de entrada para valores 0.0 ou 1.0
+    """Fast binarization + cleanup of the segmentation mask, using only PyTorch ops."""
+    # 1. Binarize input to {0.0, 1.0}
     binarized_float = torch.round(seg_map.squeeze(1))
-    
-    # 2. Adiciona a dimensão de canal para a convolução
-    # Shape: [B, H, W] -> [B, 1, H, W]
+
+    # 2. Add channel dim for conv: [B, H, W] -> [B, 1, H, W]
     image_with_channel = binarized_float.unsqueeze(1)
-    
-    # 3. Aplica o blur Gaussiano rápido
+
+    # 3. Fast separable Gaussian blur
     blurred = gaussian_blur_torch(image_with_channel, kernel_size=5, sigma=1.5)
-    
-    # 4. Re-binariza o resultado para obter a máscara final e limpa.
+
+    # 4. Re-binarize for the final cleaned mask
     cleaned_mask = torch.round(blurred)
 
     return cleaned_mask.squeeze(1)
 
 def _post_detect_minutiae_single(mnt_score, mnt_orient_batch_i, mnt_x_offset_batch_i,
                                   mnt_y_offset_batch_i, threshold, device):
-    """Detecta e aplica NMS nas minúcias para uma única imagem."""
+    """Detect and NMS minutiae for a single image."""
     rows, cols = torch.where(mnt_score > threshold)
     if rows.shape[0] == 0:
         return torch.empty((0, 4), device=device)
@@ -324,7 +309,7 @@ def _post_detect_minutiae_single(mnt_score, mnt_orient_batch_i, mnt_x_offset_bat
 
 def _post_detect_minutiae(outputs: dict, cleaned_mask: torch.Tensor, threshold: float,
                           unmodulated: bool = False):
-    """Detecta, filtra e aplica NMS nas minúcias para um lote inteiro."""
+    """Detect, filter, and NMS minutiae for a full batch."""
     mnt_score_batch = outputs['minutiae_score'].squeeze(1) * cleaned_mask
     mnt_orient_batch = outputs['minutiae_orientation']
     mnt_x_offset_batch = outputs['minutiae_x_offset']
@@ -356,42 +341,46 @@ def _post_detect_minutiae(outputs: dict, cleaned_mask: torch.Tensor, threshold: 
     return final_minutiae_list
 
 def _post_nms(minutiae: torch.Tensor, dist_thresh: float = 16.0, angle_thresh: float = torch.pi/6) -> torch.Tensor:
-    """Aplica Non-Maximum Suppression (NMS) em um tensor de minúcias."""
+    """Greedy Non-Maximum Suppression (NMS) on a minutiae tensor."""
     if minutiae.shape[0] == 0:
         return minutiae
 
-    # Ordena por score (decrescente)
+    # Sort by score (descending)
     order = torch.argsort(minutiae[:, 3], descending=True)
     minutiae = minutiae[order]
 
-    # Calcula matriz de distância Euclidiana e angular.
-    # Usa a forma direta (a-b)^2 ao invés de torch.cdist; cdist usa o atalho
-    # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a·b, que sob TF32 sofre catastrophic
-    # cancellation para coordenadas em escala de pixel (~10^3): cada termo
-    # tem erro absoluto ~ ||a||^2 * 1e-3, comparável ao próprio resultado
-    # ~16^2 = 256, fazendo a NMS flipar decisões na fronteira do dist_thresh.
-    # A forma elementwise é bit-exata sob TF32 com o mesmo custo (~0.18ms
-    # vs 0.17ms para N=2000 minúcias, contra 6.5ms para
+    # Pairwise Euclidean and angular distance matrices.
+    # Using the direct (a-b)^2 form instead of torch.cdist; cdist takes the
+    # shortcut ||a-b||^2 = ||a||^2 + ||b||^2 - 2·a·b, which under TF32
+    # suffers catastrophic cancellation for pixel-scale coordinates
+    # (~10^3): every term has absolute error ~ ||a||^2 * 1e-3, comparable
+    # to the actual result ~16^2 = 256, flipping NMS decisions near
+    # dist_thresh. The elementwise form is bit-exact under TF32 at the
+    # same cost (~0.18ms vs 0.17ms for N=2000, vs 6.5ms for
     # compute_mode='donot_use_mm_for_euclid_dist').
     xy = minutiae[:, :2]
     diff = xy.unsqueeze(0) - xy.unsqueeze(1)        # [N, N, 2]
-    dist_matrix = torch.sqrt((diff * diff).sum(-1)) # [N, N]
-    
-    # Cálculo da distância angular via broadcasting
-    angles1 = minutiae[:, 2].unsqueeze(1) # [N, 1]
-    angles2 = minutiae[:, 2].unsqueeze(0) # [1, N]
+    dist_matrix = torch.sqrt((diff * diff).sum(-1))  # [N, N]
+
+    # Angular distance via broadcasting
+    angles1 = minutiae[:, 2].unsqueeze(1)  # [N, 1]
+    angles2 = minutiae[:, 2].unsqueeze(0)  # [1, N]
     angle_delta = torch.abs(angles1 - angles2)
     angle_matrix = torch.minimum(angle_delta, 2 * torch.pi - angle_delta)
 
-    # Máscara para supressão: True onde a distância E o ângulo são menores que o limiar
+    # Suppression mask: True where BOTH distance and angle are below threshold
     suppress_mask = (dist_matrix < dist_thresh) & (angle_matrix < angle_thresh)
-    
-    keep = torch.ones(minutiae.shape[0], dtype=torch.bool, device=minutiae.device)
-    for i in range(minutiae.shape[0]):
+
+    # Greedy loop on CPU/NumPy. The original GPU loop cost ~75% of total
+    # time because each `if keep[i]:` forces a GPU→host sync (minutiae per
+    # image are in the hundreds–thousands ⇒ hundreds–thousands of syncs).
+    # The suppression matrix is small (N×N bool, a few MB at most) and the
+    # loop is bit-identical: only the execution location changes.
+    suppress_cpu = suppress_mask.cpu().numpy()
+    n = suppress_cpu.shape[0]
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
         if keep[i]:
-            # Suprime todos os outros pontos que estão muito próximos deste
-            # torch.where retorna uma tupla, pegamos o primeiro elemento
-            suppress_indices = torch.where(suppress_mask[i, i+1:])[0]
-            keep[i + 1 + suppress_indices] = False
-            
-    return minutiae[keep]
+            keep[i + 1:] &= ~suppress_cpu[i, i + 1:]
+    keep_t = torch.from_numpy(keep).to(minutiae.device)
+    return minutiae[keep_t]

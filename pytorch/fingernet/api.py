@@ -22,6 +22,14 @@ logger = get_fingernet_logger('fingernet.api', level=logging.DEBUG)
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
+# Note: torch.backends.cudnn.benchmark is intentionally left OFF (default).
+# Enabling it autotunes a per-shape best conv algorithm and gives ~17% extra
+# throughput on fixed-size workloads (e.g. BN48k 512x512), but the chosen
+# algorithm differs from cuDNN's heuristic default — combined with TF32's
+# non-associative matmul this flips a small fraction of outputs near the
+# threshold/NMS boundary vs prior extractions. Set it explicitly in user
+# code if you prefer speed over byte-level reproducibility:
+#     torch.backends.cudnn.benchmark = True
 
 class FingerprintDataset(Dataset):
     """Dataset for loading fingerprint images."""
@@ -164,7 +172,7 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = True, 
     
     base_name = os.path.splitext(original_filename)[0]
 
-    # Save minutiae (.min) - padrão: ângulo CCW em graus (int), qualidade 0-100 (int)
+    # Save minutiae (.min) — format: CCW angle in degrees (int), quality 0-100 (int)
     minutiae = result_item["minutiae"].copy()
     angle_ccw_deg = np.round((-np.rad2deg(minutiae[:, 2])) % 360).astype(int)
     quality_int = np.round(minutiae[:, 3] * 100).astype(int)
@@ -203,26 +211,27 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = True, 
     angles_deg_shifted = np.round(np.rad2deg(ori_cpu) + 90).astype(np.uint8)
     Image.fromarray(angles_deg_shifted).save(orientation_path)
 
-    # Save quality mask (.png) if present
+    # ----- Opt-in outputs (--quality-mask / --full) ----- #
+
+    # Continuous quality mask (sigmoid)
     if 'quality_mask' in result_item:
         qmask_path = os.path.join(output_path, "quality_mask", rel_dir, original_filename)
         os.makedirs(os.path.dirname(qmask_path), exist_ok=True)
         Image.fromarray(result_item["quality_mask"]).save(qmask_path)
 
-    # Save unmodulated enhanced image (.png) if present
-    if 'enhanced_image_unmod' in result_item:
-        path = os.path.join(output_path, "enhanced_unmod", rel_dir, original_filename)
+    # Modulated enhanced/orientation (multiplied by the mask) — --full only
+    if 'enhanced_image_mod' in result_item:
+        path = os.path.join(output_path, "enhanced_mod", rel_dir, original_filename)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        Image.fromarray(result_item["enhanced_image_unmod"]).save(path)
+        Image.fromarray(result_item["enhanced_image_mod"]).save(path)
 
-    # Save unmodulated orientation field (encoded as PNG) if present
-    if 'orientation_field_unmod' in result_item:
-        path = os.path.join(output_path, "ori_unmod", rel_dir, original_filename)
+    if 'orientation_field_mod' in result_item:
+        path = os.path.join(output_path, "ori_mod", rel_dir, original_filename)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        angles = np.round(np.rad2deg(result_item["orientation_field_unmod"]) + 90).astype(np.uint8)
+        angles = np.round(np.rad2deg(result_item["orientation_field_mod"]) + 90).astype(np.uint8)
         Image.fromarray(angles).save(path)
 
-    # Save unmodulated minutiae (.min) if present
+    # Minutiae before the mask filter — --full only
     if 'minutiae_unmod' in result_item:
         mnt_unmod = result_item["minutiae_unmod"].copy()
         angle_ccw_deg_unmod = np.round((-np.rad2deg(mnt_unmod[:, 2])) % 360).astype(int)
@@ -250,17 +259,17 @@ def postprocess_and_save_batch(
     mnt_degrees: bool,
     input_base_path: str = None,
     quality_mask: bool = False,
-    unmodulated: bool = False,
-    threshold: float = 0.5,
+    full: bool = False,
+    threshold: float = 0.05,
 ):
-    """Executa pós-processamento e salva os resultados de um lote."""
+    """Run post-processing and save the results of one batch."""
     worker_id = threading.get_ident()
 
     logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
         with FnetTimer("Post-processing", logger) as t_post:
             final_outputs = postprocess(raw_outputs_cpu, threshold=threshold,
-                                        quality_mask=quality_mask, unmodulated=unmodulated)
+                                        quality_mask=quality_mask, full=full)
 
         padded_h, padded_w = padded_shape
 
@@ -281,11 +290,11 @@ def postprocess_and_save_batch(
                 "orientation_field": ori_field,
             }
 
-            if quality_mask:
+            if quality_mask or full:
                 result_item["quality_mask"] = final_outputs["quality_mask"][i][:orig_h, :orig_w].numpy()
-            if unmodulated:
-                result_item["enhanced_image_unmod"] = final_outputs["enhanced_image_unmod"][i][:orig_h, :orig_w].numpy()
-                result_item["orientation_field_unmod"] = final_outputs["orientation_field_unmod"][i][:orig_h, :orig_w].numpy()
+            if full:
+                result_item["enhanced_image_mod"] = final_outputs["enhanced_image_mod"][i][:orig_h, :orig_w].numpy()
+                result_item["orientation_field_mod"] = final_outputs["orientation_field_mod"][i][:orig_h, :orig_w].numpy()
                 result_item["minutiae_unmod"] = final_outputs["minutiae_unmod"][i].numpy()
 
             save_results(result_item, output_path, mnt_degrees, input_base_path)
@@ -299,19 +308,31 @@ def postprocess_and_save_batch(
             }
         )
     except Exception as e:
-        warnings.warn(f"Falha no pós-processamento do lote iniciado com {os.path.basename(batch_paths[0])}. Erro: {e}")
+        warnings.warn(f"Post-processing failed for the batch starting at {os.path.basename(batch_paths[0])}. Error: {e}")
 
-def create_output_directories(output_path: str, quality_mask: bool = False, unmodulated: bool = False):
-    """Create output directory structure."""
+def create_output_directories(output_path: str, quality_mask: bool = False, full: bool = False):
+    """Create the output directory structure.
+
+    Always created: ``minutiae/``, ``mask/``, ``enhanced/``, ``ori/`` —
+    where ``ori/`` holds the orientation field WITHOUT mask modulation and
+    ``enhanced/`` holds the enhanced image WITHOUT mask modulation. These
+    "raw" versions preserve full spatial information.
+
+    Optional:
+        ``quality_mask=True`` → also creates ``quality_mask/``.
+        ``full=True``         → creates ``quality_mask/``, ``enhanced_mod/``,
+                                ``ori_mod/`` (mask-modulated) and
+                                ``minutiae_unmod/`` (without mask filter).
+    """
     os.makedirs(os.path.join(output_path, "minutiae"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "mask"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "enhanced"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "ori"), exist_ok=True)
-    if quality_mask:
+    if quality_mask or full:
         os.makedirs(os.path.join(output_path, "quality_mask"), exist_ok=True)
-    if unmodulated:
-        os.makedirs(os.path.join(output_path, "enhanced_unmod"), exist_ok=True)
-        os.makedirs(os.path.join(output_path, "ori_unmod"), exist_ok=True)
+    if full:
+        os.makedirs(os.path.join(output_path, "enhanced_mod"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "ori_mod"), exist_ok=True)
         os.makedirs(os.path.join(output_path, "minutiae_unmod"), exist_ok=True)
 
 def setup_ddp(rank: int, world_size: int, local_device_idx: int, timeout_minutes: int = 30):
@@ -346,8 +367,8 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 def _ddp_launch_target(rank: int, world_size: int, config: dict):
-    """Função alvo para mp.spawn."""
-    # Com CUDA_VISIBLE_DEVICES já aplicado, rank == índice lógico da GPU.
+    """Target function for mp.spawn."""
+    # With CUDA_VISIBLE_DEVICES already applied, rank == logical GPU index.
     runner = InferenceRunner(config)
     runner.setup(rank, world_size, rank)
     runner.run()
@@ -357,17 +378,16 @@ def run_inference(
     output_path: str,
     weights_path: str = DEFAULT_WEIGHTS_PATH,
     gpus: int | list[int] | None = None,
-    batch_size: int = 4,
+    batch_size: int = 8,
     num_workers: int = 4,
     recursive: bool = True,
     mnt_degrees: bool = True,
-    threshold: float = 0.5,
+    threshold: float = 0.05,
     compile_model: bool = False,
     max_image_dim: int = 1024,
-    strategy: str = 'hybrid',
+    strategy: str = 'full_gpu',
     num_cpu_workers: int = 4,
     quality_mask: bool = False,
-    unmodulated: bool = False,
     full: bool = False,
 ):
     """
@@ -393,7 +413,6 @@ def run_inference(
     """
     if full:
         quality_mask = True
-        unmodulated = True
 
     image_paths = find_image_paths(input_path, recursive)
 
@@ -407,7 +426,7 @@ def run_inference(
     else:
         input_base_path = None
 
-    # Coleta toda a configuração em um único dicionário para facilitar
+    # Collect all config into one dict for convenience
     config = locals()
 
     use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
@@ -476,28 +495,26 @@ def _save_results_chunk(
     worker_rank: int = -1,
     input_base_path: str = None
 ):
-    """
-    Função alvo para um worker thread. Recebe um bloco de resultados e os salva em disco.
-    """
-    # Usamos uma descrição simples se não for um processo DDP
+    """Worker thread target. Receives a chunk of results and saves them to disk."""
     desc = f"Saving (Worker {worker_rank})" if worker_rank >= 0 else "Saving Results"
-    
-    # O worker não deve mostrar uma barra de progresso individual, pois várias podem ser executadas
-    # em paralelo. Apenas iteramos e salvamos.
+
+    # Workers shouldn't show individual progress bars (many can run in
+    # parallel). Just iterate and save.
     for result_item in results_chunk:
         try:
             save_results(result_item, output_path, mnt_degrees, input_base_path)
         except Exception as e:
-            # Log de erro é importante em threads para não falhar silenciosamente
+            # Logging matters in threads — otherwise failures are silent.
             base_name = os.path.basename(result_item.get('input_path', 'unknown_file'))
             logger.warning(f"Failed to save result for {base_name} in chunk. Error: {e}")
 
 
 class InferenceRunner:
     def __init__(self, config: dict):
-        """
-        Inicializa o runner com toda a configuração necessária.
-        'config' é um dicionário contendo tudo: image_paths, output_path, batch_size, etc.
+        """Initialize the runner with all required configuration.
+
+        ``config`` is a dict that holds everything: image_paths,
+        output_path, batch_size, etc.
         """
         self.config = config
         self.strategy = None
@@ -509,23 +526,23 @@ class InferenceRunner:
         self.dataloader = None
 
     def setup(self, rank: int = -1, world_size: int = 1, gpu_id: int = 0):
-        """
-        Configura o ambiente para este processo específico (worker).
-        Isso inclui DDP, device, modelo e dataloader.
-        
+        """Configure the environment for this worker process.
+
+        Sets up DDP, device, model, and dataloader.
+
         Args:
-            rank: Rank do processo no DDP (-1 para single process)
-            world_size: Número total de processos
-            gpu_id: Índice lógico da GPU a usar (para DDP)
+            rank: DDP process rank (-1 for single-process mode)
+            world_size: Total number of processes
+            gpu_id: Logical GPU index to use (for DDP)
         """
         self.rank = rank
         self.world_size = world_size
         self.is_main_process = (rank <= 0) # Rank 0 para DDP, -1 para single/cpu
 
-        # 1. Configurar DDP e Device
+        # 1. Configure DDP and device
         if self.world_size > 1:
             setup_ddp(self.rank, self.world_size, gpu_id)
-            # Usa o índice lógico correto após remapeamento do CUDA_VISIBLE_DEVICES
+            # Use the correct logical index after CUDA_VISIBLE_DEVICES remap
             self.device = f"cuda:{gpu_id}"
         elif self.config['gpus'] and torch.cuda.is_available():
             self.device = "cuda:0"
@@ -537,13 +554,13 @@ class InferenceRunner:
             create_output_directories(
                 self.config['output_path'],
                 quality_mask=self.config.get('quality_mask', False),
-                unmodulated=self.config.get('unmodulated', False)
+                full=self.config.get('full', False),
             )
         
         if self.world_size > 1:
-            dist.barrier() # Garante que as pastas foram criadas
+            dist.barrier()  # Ensure the output dirs are visible to all ranks
 
-        # 2. Carregar o Modelo
+        # 2. Load the model
         self.model = get_fingernet(
             weights_path=self.config['weights_path'],
             device=self.device
@@ -551,10 +568,10 @@ class InferenceRunner:
         if self.config['compile_model']:
             if self.is_main_process: logger.info("Compiling model with torch.compile...")
             self.model = torch.compile(self.model)
-        
-        # O DDP wrapper não é necessário para inferência, simplifica o código.
 
-        # 3. Preparar Dataset e DataLoader
+        # No need to wrap the model with DDP for inference — keeps things simple.
+
+        # 3. Set up dataset and dataloader
         dataset = FingerprintDataset(self.config['image_paths'], max_dim=self.config['max_image_dim'])
         sampler = None
         shuffle = False
@@ -574,11 +591,11 @@ class InferenceRunner:
             collate_fn=dynamic_padding_collate,
         )
 
-        # 4. Definir a estratégia de execução
+        # 4. Pick execution strategy
         self.strategy = self.config['strategy']
 
     def run(self):
-        """Despacha para o método de execução correto baseado na estratégia."""
+        """Dispatch to the right execution method based on the strategy."""
         if self.is_main_process:
             logger.info(f"Executing with strategy: '{self.strategy}'")
 
@@ -597,8 +614,8 @@ class InferenceRunner:
             logger.info("✓ Inference Complete!")
     
     def _run_hybrid(self):
-        """Executa o pipeline otimizado para throughput (GPU-infer, CPU-postproc)."""
-        # Esta é a lógica que já tínhamos, usando ThreadPoolExecutor.
+        """Throughput-oriented pipeline (GPU forward, CPU post-processing)."""
+        # Uses ThreadPoolExecutor to overlap CPU post-proc with the next GPU batch.
         if self.is_main_process:
             logger.info("Starting inference loop...")
 
@@ -608,38 +625,38 @@ class InferenceRunner:
             futures = []
             max_queue_size = 2 * num_cpu_workers
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 desc = f"GPU {self.rank}" if self.world_size > 1 else "Processing"
                 iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
-                
+
                 for batch_tensors, batch_paths, batch_orig_shapes in iterator:
                     if batch_tensors is None: continue
 
-                    # --- ETAPA GPU/CPU: INFERÊNCIA ---
+                    # --- GPU INFERENCE STAGE ---
                     _, _, padded_h, padded_w = batch_tensors.shape
-                    batch_tensors = batch_tensors.to(self.device)
-                    raw_outputs = self.model.fingernet(batch_tensors) # Chama o modelo core
+                    batch_tensors = batch_tensors.to(self.device, non_blocking=True)
+                    raw_outputs = self.model.fingernet(batch_tensors)  # core model
 
-                    # --- ETAPA DE TRANSFERÊNCIA (se necessário) ---
+                    # --- D2H TRANSFER ---
                     raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
 
-                    # --- ETAPA DE SUBMISSÃO PARA CPU WORKERS ---
+                    # --- DISPATCH TO CPU WORKERS ---
                     future = executor.submit(
                         postprocess_and_save_batch,
                         raw_outputs_cpu, batch_paths, batch_orig_shapes,
                         (padded_h, padded_w), self.config['output_path'], self.config['mnt_degrees'],
                         self.config.get('input_base_path'),
                         self.config.get('quality_mask', False),
-                        self.config.get('unmodulated', False),
-                        self.config.get('threshold', 0.5),
+                        self.config.get('full', False),
+                        self.config.get('threshold', 0.05),
                     )
                     futures.append(future)
 
-                    # Gerenciamento da fila para evitar sobrecarga de memória
+                    # Bound the queue to avoid runaway memory usage
                     if len(futures) >= max_queue_size:
-                        futures.pop(0).result() # Espera o mais antigo terminar
+                        futures.pop(0).result()  # wait for the oldest to drain
 
-            # Aguardar finalização de todas as tarefas
+            # Wait for everything still in flight
             if self.is_main_process:
                 logger.info("Inference complete. Finalizing post-processing...")
             for future in tqdm(futures, desc=f"Finalizing (Worker {self.rank})", disable=not self.is_main_process):
@@ -647,35 +664,37 @@ class InferenceRunner:
 
         
     def _run_full_gpu(self):
-        """
-        Executa o pipeline otimizado para latência (tudo na GPU) com salvamento assíncrono.
-        """
-        # Use o mesmo número de workers da CPU que a estratégia híbrida para consistência
+        """Latency-oriented pipeline (everything on the GPU), with async save."""
+        # Same CPU-worker count as the hybrid strategy, for consistency
         num_save_workers = self.config['num_cpu_workers']
-        
-        # O tamanho do bloco que aciona o salvamento. Ex: 4 (batch_size) * 10 = 40 imagens.
-        # Isso evita despachar tarefas muito pequenas para os workers.
-        chunk_size = self.config['batch_size'] * 10 
 
-        # Pool de workers para salvar os resultados em segundo plano
+        # Chunk that triggers a save dispatch (e.g. batch_size 8 × 10 = 80 imgs).
+        # Avoids dispatching too-small tasks to the save workers.
+        chunk_size = self.config['batch_size'] * 10
+
+        # Background pool that saves results to disk
         with ThreadPoolExecutor(max_workers=num_save_workers) as save_executor:
             futures = []
-            chunk_para_salvar = []
+            save_chunk = []
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 desc = f"GPU {self.rank}" if self.world_size > 1 else "Processing"
                 iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
-                
+
                 for batch_tensors, batch_paths, batch_orig_shapes in iterator:
                     if batch_tensors is None: continue
 
-                    # --- ETAPA GPU: Inferência E Pós-processamento ---
-                    batch_tensors = batch_tensors.to(self.device)
+                    # --- GPU STAGE: forward + post-processing ---
+                    batch_tensors = batch_tensors.to(self.device, non_blocking=True)
                     _qm = self.config.get('quality_mask', False)
-                    _um = self.config.get('unmodulated', False)
-                    final_outputs = self.model(batch_tensors, minutiae_threshold=self.config.get('threshold', 0.5), quality_mask=_qm, unmodulated=_um)
+                    _full = self.config.get('full', False)
+                    final_outputs = self.model(
+                        batch_tensors,
+                        minutiae_threshold=self.config.get('threshold', 0.05),
+                        quality_mask=_qm, full=_full,
+                    )
 
-                    # --- ETAPA DE TRANSFERÊNCIA E COLETA (RÁPIDA) ---
+                    # --- D2H + COLLECT (cheap) ---
                     for i in range(len(batch_paths)):
                         orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
                         result_item = {
@@ -685,33 +704,33 @@ class InferenceRunner:
                             'segmentation_mask': final_outputs['segmentation_mask'][i][:orig_h, :orig_w].cpu().numpy(),
                             'orientation_field': final_outputs['orientation_field'][i][:orig_h, :orig_w].cpu().numpy(),
                         }
-                        if _qm and 'quality_mask' in final_outputs:
+                        if (_qm or _full) and 'quality_mask' in final_outputs:
                             result_item['quality_mask'] = final_outputs['quality_mask'][i][:orig_h, :orig_w].cpu().numpy()
-                        if _um:
-                            result_item['enhanced_image_unmod'] = final_outputs['enhanced_image_unmod'][i][:orig_h, :orig_w].cpu().numpy()
-                            result_item['orientation_field_unmod'] = final_outputs['orientation_field_unmod'][i][:orig_h, :orig_w].cpu().numpy()
+                        if _full:
+                            result_item['enhanced_image_mod'] = final_outputs['enhanced_image_mod'][i][:orig_h, :orig_w].cpu().numpy()
+                            result_item['orientation_field_mod'] = final_outputs['orientation_field_mod'][i][:orig_h, :orig_w].cpu().numpy()
                             result_item['minutiae_unmod'] = final_outputs['minutiae_unmod'][i].cpu().numpy()
-                        chunk_para_salvar.append(result_item)
+                        save_chunk.append(result_item)
 
-                    # --- ETAPA DE DESPACHO PARA WORKERS ---
-                    if len(chunk_para_salvar) >= chunk_size:
+                    # --- DISPATCH SAVE CHUNK ---
+                    if len(save_chunk) >= chunk_size:
                         future = save_executor.submit(
                             _save_results_chunk,
-                            chunk_para_salvar,
+                            save_chunk,
                             self.config['output_path'],
                             self.config['mnt_degrees'],
                             self.rank,
                             self.config.get('input_base_path')
                         )
                         futures.append(future)
-                        chunk_para_salvar = []  # Limpa o bloco para o próximo ciclo
+                        save_chunk = []  # reset for the next cycle
 
-            # --- FINALIZAÇÃO ---
-            # Despacha o último bloco, que pode ser menor que o chunk_size
-            if chunk_para_salvar:
+            # --- FINALIZATION ---
+            # Dispatch the last (possibly smaller) chunk
+            if save_chunk:
                 future = save_executor.submit(
                     _save_results_chunk,
-                    chunk_para_salvar,
+                    save_chunk,
                     self.config['output_path'],
                     self.config['mnt_degrees'],
                     self.rank,
@@ -719,10 +738,10 @@ class InferenceRunner:
                 )
                 futures.append(future)
 
-            # Aguarda todos os workers de salvamento terminarem seu trabalho
+            # Wait for all save workers to drain
             if self.is_main_process:
                 logger.info("Inference complete. Waiting for save workers to finish...")
-            
-            # Usamos uma barra de progresso para esperar os futuros, dando feedback ao usuário
+
+            # Use a progress bar to give feedback while waiting on the futures
             for future in tqdm(futures, desc=f"Finalizing Save (Worker {self.rank})", disable=not self.is_main_process):
-                future.result() # .result() espera a conclusão e levanta exceções se houver
+                future.result()  # waits for completion and re-raises exceptions

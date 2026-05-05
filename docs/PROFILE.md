@@ -328,18 +328,51 @@ If more speed is needed, in increasing risk order:
    potentially 10–30% on forward. Risk: already exposed via `--compile`
    in the CLI, marked experimental; numeric drift would need
    validation.
-2. **Channels-last memory format** on the GPU — historically ~10% on
-   VGG. Currently only enabled on the CPU path.
-3. **AMP / bf16 autocast** — another 1.5–2× on forward on H100, but can
+2. **AMP / bf16 autocast** — another 1.5–2× on forward on H100, but can
    flip minutiae near the threshold (numeric). Needs a quality
    benchmark.
-4. **D2H into pinned host buffers + non-blocking** — saturate PCIe and
+3. **D2H into pinned host buffers + non-blocking** — saturate PCIe and
    overlap with the next batch. Today `.cpu()` is blocking.
-5. **NMS pre-filter via cell-list** before the N×N matrix — currently
+4. **NMS pre-filter via cell-list** before the N×N matrix — currently
    quadratic in N. Can hurt for latents with thousands of candidates.
-6. **Replace `enhancement_module._select_max_orientation`** —
+5. **Replace `enhancement_module._select_max_orientation`** —
    normalization + softmax-like with `torch.where` is 3–4 separate
    kernels; could fuse into one (or rewrite in Triton).
+
+## Tested optimizations that DON'T work
+
+### `channels_last` memory format on GPU
+
+The standard rule of thumb is "NHWC + Tensor Cores beats NCHW for
+conv-heavy networks". On this model, **NHWC is 19% slower** end-to-end
+(BN48k 1000 imgs, 1× H100, 5 trials, both `cudnn.benchmark` on and off).
+
+Per-stage breakdown (ms / batch of 8, 30 iterations averaged):
+
+| Stage | NCHW | NHWC | Speedup |
+|---|---:|---:|---:|
+| feature_extractor (VGG) | 15.9 | 12.8 | **1.24×** ✓ |
+| ori_seg_head | 3.3 | 4.0 | 0.82× ✗ |
+| enhancement | 41.6 | 77.4 | 0.54× ✗ |
+| &nbsp;&nbsp;gabor_real (1→90 ch, 25×25) | 18.6 | 70.1 | **0.26×** ✗ |
+| &nbsp;&nbsp;gabor_imag (1→90 ch, 25×25) | 18.4 | 70.1 | **0.26×** ✗ |
+
+**Root cause.** Tensor Core kernels in NHWC require channel counts
+that are multiples of 8 (or 4 for TF32). The two Gabor convolutions
+have **1 input channel**, so NHWC cannot dispatch to the fast implicit
+GEMM path and falls back to a naive kernel — making them 3.8× *slower*
+than NCHW. Since the enhancement module dominates (~50% of forward),
+the ~24% gain on the VGG backbone is wiped out.
+
+Bonus reason not to apply this: NHWC outputs are **not bit-identical**
+to NCHW (cuDNN picks different conv algorithms per layout, and TF32
+reduction order differs by algorithm). It would silently regress the
+reproducibility we worked to preserve.
+
+**Verdict: do not apply.** This is the classic case where a generic
+optimization rule fails on a specific model architecture. The fix
+would be at the model level (e.g. make Gabor a depthwise-then-pointwise
+factorization with proper channel counts), not at the layout flag.
 
 ## Advanced profiling: Chrome trace
 

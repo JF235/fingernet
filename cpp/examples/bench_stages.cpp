@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "arandu/graph.hpp"
-#include "arandu/stream_executor.hpp"
+#include "arandu/pipeline_executor.hpp"
 #include "fingernet/arandu_nodes.hpp"
 #include "fingernet/io_nodes.hpp"
 #include "fingernet/onnx_model.hpp"
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     // ---- Stage 2: POSTPROC (parallel across items) ------------------------
     arandu::Graph gpost = build_postproc_graph();
     auto pol = arandu::ExecPolicy::elft_submission(); pol.cpu_threads = T;
-    arandu::StreamExecutor se(pol);
+    arandu::PipelineExecutor se(pol);   // StreamExecutor was retired into this one
     auto post_any = se.run(gpost, raw_any);                  // warmup
     t0 = clk::now();
     post_any = se.run(gpost, raw_any);

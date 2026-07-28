@@ -4,7 +4,9 @@
 // K-way CPU phases; native profiler attributes Wait/Compute/Emit per phase and
 // gpu_run/extract inside the model. Usage:
 //   full_graph <onnx> <imgs> <out> [N] [exec] [T] [provider] [B] [warmup] [model_actors]
-//   exec: pipeline (default) | serial | stream ;  out="none" skips disk
+//   exec: pipeline (default) | serial | cpu ;  out="none" skips disk
+//   (`cpu` is the same PipelineExecutor forced onto the CPU fallback -- it is what the
+//    retired StreamExecutor did, and `stream` is still accepted for that.)
 #include <algorithm>
 #include <any>
 #include <chrono>
@@ -17,7 +19,7 @@
 #include "arandu/graph.hpp"
 #include "arandu/pipeline_executor.hpp"
 #include "arandu/profiling.hpp"
-#include "arandu/stream_executor.hpp"
+#include "arandu/serial_executor.hpp"
 #include "fingernet/arandu_nodes.hpp"
 #include "fingernet/io_nodes.hpp"
 #include "fingernet/onnx_model.hpp"
@@ -83,7 +85,12 @@ int main(int argc, char** argv) {
     auto t0 = clk::now();
     std::vector<std::any> res;
     if (exec == "pipeline")     res = arandu::PipelineExecutor{pol}.run(g, input);
-    else if (exec == "stream") { pol.device = arandu::Device::Cpu; res = arandu::StreamExecutor{pol}.run(g, input); }
+    else if (exec == "cpu" || exec == "stream") {
+        // The CPU fallback of the same executor: with device=Cpu every phase resolves to
+        // its cpu impl, which is exactly what the retired StreamExecutor was.
+        pol.device = arandu::Device::Cpu;
+        res = arandu::PipelineExecutor{pol}.run(g, input);
+    }
     else                        res = arandu::SerialExecutor{}.run(g, input);
     double t_run = secs(t0, clk::now());
 

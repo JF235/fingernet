@@ -1,6 +1,6 @@
 // Demonstrate the FingerNet postproc blocks running as an arandu graph:
 //  - build the chain mask->quality->ori->enhanced->minutiae
-//  - SerialExecutor (ELFT floor) vs StreamExecutor(T) must be BYTE-IDENTICAL
+//  - SerialExecutor (ELFT floor) vs PipelineExecutor(T) must be BYTE-IDENTICAL
 //  - Serial output must match the Python reference (same as the standalone gate)
 // Usage: arandu_demo <refdump_dir> [num_imgs] [threads]
 #include <algorithm>
@@ -15,7 +15,8 @@
 #include <vector>
 
 #include "arandu/graph.hpp"
-#include "arandu/stream_executor.hpp"
+#include "arandu/pipeline_executor.hpp"
+#include "arandu/serial_executor.hpp"
 #include "fingernet/arandu_nodes.hpp"
 #include "fingernet/minfmt.hpp"
 #include "fingernet/npy.hpp"
@@ -79,15 +80,19 @@ int main(int argc, char** argv) {
     auto rs = serial.run(g, input);
     auto t1 = clk::now();
     arandu::ExecPolicy pol = arandu::ExecPolicy::elft_submission(); pol.cpu_threads = T;
-    arandu::StreamExecutor stream(pol);
+    // Was StreamExecutor, which arandu retired into the PipelineExecutor (it was the
+    // same thing minus the model phases). On this CPU-only graph under elft_submission
+    // every phase resolves to its Cpu impl, so the byte-identity asserted below is the
+    // same claim it always was.
+    arandu::PipelineExecutor stream(pol);
     auto t2 = clk::now();
     auto rp = stream.run(g, input);
     auto t3 = clk::now();
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    printf("Serial: %.1f ms (%.1f img/s)   Stream(T=%d): %.1f ms (%.1f img/s)  speedup %.1fx\n",
+    printf("Serial: %.1f ms (%.1f img/s)   Pipeline(T=%d): %.1f ms (%.1f img/s)  speedup %.1fx\n",
            ms(t0, t1), 1000.0 * N / ms(t0, t1), T, ms(t2, t3), 1000.0 * N / ms(t2, t3), ms(t0, t1) / ms(t2, t3));
 
-    // (1) Serial == Stream, byte-for-byte (thread invariance)
+    // (1) Serial == Pipeline, byte-for-byte (thread invariance)
     long dmask = 0, dqual = 0, dori = 0, denh = 0, dmnt = 0;
     for (int i = 0; i < N; ++i) {
         const Bundle& a = std::any_cast<const Bundle&>(rs[i]);

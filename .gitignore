@@ -3,3 +3,28 @@ __pycache__
 .vscode
 *.pyc
 *.egg-info
+
+# ---- C++ / CMake build trees -------------------------------------------------
+# Added with the cpp/ port. Without these, a CMake build tree puts ~76 regenerable
+# files in `git status` -- which buries the handful of real source files and makes
+# `git clean -fd` (the natural reflex in a repo that looks full of artefacts) delete
+# the port along with the objects, because git cannot tell them apart.
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+
+# ---- Models / weights (fetched or exported out-of-band) ----------------------
+*.onnx
+*.engine
+*.plan

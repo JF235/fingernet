@@ -28,6 +28,11 @@ struct FnetOnnxConfig {
     int max_batch = 8;
     bool fp16 = false;
     std::string engine_cache;
+    // Nominal input shape, for the transport declaration ONLY (see transport()). The real
+    // shape is per-image; arandu::TransportSpec is a per-item promise the profiler reports
+    // and can assert, not a buffer size. Defaults to the SD258 padded shape.
+    int nominal_h = 768;
+    int nominal_w = 800;
 };
 
 // Both ICpuScript (fallback / SerialExecutor) and IModel (PipelineExecutor's
@@ -72,6 +77,29 @@ public:
     }
     int max_batch() const override { return cfg_.max_batch; }
     bool bit_exact_batch_invariant() const override { return cfg_.provider == "cpu"; }
+
+    // What crosses the device boundary per image. arandu::IModel::transport() has no
+    // default on purpose: this model is the reason. Its full ONNX export shipped an
+    // orientation map at INPUT resolution (~221 MB/image) whose D2H cost 127 ms against
+    // 15 ms of compute -- 8x the forward, spent inside the same call, so it read as slow
+    // inference on an idle GPU. Summing the output shapes once, here, is what makes that
+    // visible instead of mysterious.
+    //
+    // The coarse heads live on a stride-8 grid (hw = HW/64); enhanced_real is full-res:
+    //   segmentation hw + orientation 90*hw + minutiae_orientation 180*hw
+    //   + minutiae_{x,y}_offset 8*hw each + minutiae_score hw   = 288*hw
+    //   + enhanced_real HW
+    // = 288*HW/64 + HW = 5.5*HW floats = 22 bytes per input pixel.
+    //
+    // Both directions are PAGEABLE and declared as such: the input is staged through a
+    // plain std::vector<float> in forward_chunk, and the outputs come back through ORT's
+    // default host allocator. Neither is pinned, and saying so is the point -- a pageable
+    // bulk copy runs at ~6 GB/s where pinned reaches ~28.
+    arandu::TransportSpec transport() const override {
+        const std::size_t px = (std::size_t)cfg_.nominal_h * cfg_.nominal_w;
+        return {/*d2h*/ px * 22, /*h2d*/ px * sizeof(float),
+                /*d2h_pinned*/ false, /*h2d_pinned*/ false};
+    }
 
 private:
     void forward(std::span<const InputImage> in, std::span<Bundle> out, arandu::RunCtx& ctx) const {

@@ -36,7 +36,7 @@ class _LazyImport:
 run_inference = _LazyImport("api", "run_inference")
 get_fingernet_core = _LazyImport("model", "get_fingernet_core")
 get_fingernet = _LazyImport("wrapper", "get_fingernet")
-FingerNetWrapper = _LazyImport("model", "FingerNetWrapper")
+FingerNetWrapper = _LazyImport("wrapper", "FingerNetWrapper")
 plot_output = _LazyImport("plot", "plot_output")
 plot_raw_output = _LazyImport("plot", "plot_raw_output")
 get_fingernet_logger = _LazyImport("fnet_utils", "get_fingernet_logger")

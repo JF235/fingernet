@@ -35,16 +35,24 @@ def get_fingernet_logger(name: str, level: Optional[int] = None) -> logging.Logg
     return logger
 
 class FnetTimer:
-    """ Timer to use with util and logger in DEBUG level """
-    def __init__(self, name: str, logger: logging.Logger):
+    """ Timer to use with util and logger in DEBUG level.
+
+    `enabled=False` makes it a no-op, so a hot path can be written once and
+    profiled by a flag instead of by a second copy of the code.
+    """
+    def __init__(self, name: str, logger: logging.Logger, enabled: bool = True):
         self.name = name
         self.logger = logger
+        self.enabled = enabled
 
     def __enter__(self):
-        self.start = time.perf_counter()
+        if self.enabled:
+            self.start = time.perf_counter()
         return self
 
     def __exit__(self, *args):
+        if not self.enabled:
+            return
         self.end = time.perf_counter()
         self.interval = self.end - self.start
         self.logger.debug(f"{self.name} - {self.interval:.3f} s")

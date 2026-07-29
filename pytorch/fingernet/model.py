@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from scipy import signal
 import os
-import kornia
+
 from .fnet_utils import get_fingernet_logger, FnetTimer, logging, DEFAULT_DEVICE, DEFAULT_WEIGHTS_PATH
 
 logger = get_fingernet_logger(__name__, level=logging.INFO)
@@ -167,6 +167,12 @@ class MinutiaeHead(nn.Module):
 
 class FingerNet(nn.Module):
     """Complete FingerNet model — orchestrates the data flow across blocks."""
+
+    #: What forward() returns, in export order. The post-processing reads all of it.
+    OUTPUTS = ('enhanced_real', 'segmentation', 'orientation',
+               'minutiae_orientation', 'minutiae_x_offset', 'minutiae_y_offset',
+               'minutiae_score')
+
     def __init__(self):
         super().__init__()
         self.img_norm = ImgNormalization()
@@ -191,73 +197,40 @@ class FingerNet(nn.Module):
         enh_real, _, _ = self.enhancement_module(x, ori_map)
         return enh_real
 
-    def forward(self, x: torch.Tensor):
-        """Define the data flow and return a dict with all outputs."""
-        # Pipeline stages
+    def forward(self, x: torch.Tensor, profile: bool = False):
+        """Return the OUTPUTS dict. `profile=True` times each stage (DEBUG log)."""
         x_norm = self.img_norm(x)
-        features = self.feature_extractor(x_norm)
 
-        ori_map, seg_map = self.ori_seg_head(features)
+        with FnetTimer("Feature Extraction", logger, profile):
+            features = self.feature_extractor(x_norm)
 
-        enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
+        with FnetTimer("Orientation and Segmentation Head", logger, profile):
+            ori_map, seg_map = self.ori_seg_head(features)
 
-        upsampled_seg = F.interpolate(nn.functional.softsign(seg_map), scale_factor=8, mode='nearest')
-        upsampled_seg_out = F.interpolate(seg_map, scale_factor=8, mode='nearest')
+        with FnetTimer("Enhancement Module", logger, profile):
+            # 3rd return is the 90-channel full-res orientation map: an internal of
+            # the Gabor selection, 221 MB/image if returned, read by no consumer.
+            enh_real, enh_phase, _ = self.enhancement_module(x, ori_map)
 
+        upsampled_seg = F.interpolate(F.softsign(seg_map), scale_factor=8, mode='nearest')
         minutiae_input = torch.cat([enh_phase, upsampled_seg], dim=1)
-        
-        mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
 
-        # Return a dict with named outputs for clarity
+        with FnetTimer("Minutiae Head", logger, profile):
+            mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
+
         return {
-            'orientation upsample': upsampled_ori_map,
-            'segmentation upsample': upsampled_seg_out,
+            'enhanced_real': enh_real,
             'segmentation': seg_map,
             'orientation': ori_map,
-            'enhanced_real': enh_real,
-            'enhanced_phase': enh_phase,
             'minutiae_orientation': mnt_o,
             'minutiae_x_offset': mnt_w,
             'minutiae_y_offset': mnt_h,
-            'minutiae_score': mnt_s
+            'minutiae_score': mnt_s,
         }
 
     def time(self, x: torch.Tensor):
-        """Define the data flow and return a dict with all outputs."""
-        # Pipeline stages
-
-        x_norm = self.img_norm(x)
-
-        with FnetTimer("Feature Extraction", logger):
-            features = self.feature_extractor(x_norm)
-
-        with FnetTimer("Orientation and Segmentation Head", logger):
-            ori_map, seg_map = self.ori_seg_head(features)
-
-        with FnetTimer("Enhancement Module", logger):
-            enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
-
-        upsampled_seg = F.interpolate(nn.functional.softsign(seg_map), scale_factor=8, mode='nearest')
-        upsampled_seg_out = F.interpolate(seg_map, scale_factor=8, mode='nearest')
-
-        minutiae_input = torch.cat([enh_phase, upsampled_seg], dim=1)
-        
-        with FnetTimer("Minutiae Head", logger):
-            mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
-
-        # Return a dict with named outputs for clarity
-        return {
-            'orientation upsample': upsampled_ori_map,
-            'segmentation upsample': upsampled_seg_out,
-            'segmentation': seg_map,
-            'orientation': ori_map,
-            'enhanced_real': enh_real,
-            'enhanced_phase': enh_phase,
-            'minutiae_orientation': mnt_o,
-            'minutiae_x_offset': mnt_w,
-            'minutiae_y_offset': mnt_h,
-            'minutiae_score': mnt_s
-        }
+        """Alias for ``forward(x, profile=True)``."""
+        return self.forward(x, profile=True)
 
 def get_fingernet_core(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNet:
     if not os.path.exists(weights_path):

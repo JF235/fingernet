@@ -208,7 +208,7 @@ def instrumented_step(
 
     with gtimer.stage("post_minutiae_detect_nms"):
         final_minutiae_list = _post_detect_minutiae(
-            raw_outputs, cleaned_mask, threshold
+            raw_outputs, threshold, cleaned_mask
         )
 
     with gtimer.stage("post_orientation_field"):

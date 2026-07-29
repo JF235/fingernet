@@ -23,18 +23,6 @@ class FingerNetWrapper(nn.Module):
 
         return self.postprocess(raw_outputs, minutiae_threshold)
 
-    def time(self, x: torch.Tensor,
-             minutiae_threshold: float = 0.05) -> dict[str, torch.Tensor]:
-
-        padded_x = self.preprocess(x)
-
-        with torch.no_grad():
-            with FnetTimer("Full Inference", logger):
-                raw_outputs = self.fingernet(padded_x, profile=True)
-
-        with FnetTimer("Post-processing", logger):
-            return self.postprocess(raw_outputs, minutiae_threshold, profile=True)
-
     def prepare_input(self, x: np.ndarray) -> torch.Tensor:
         """Converts a numpy image to a torch tensor suitable for the model."""
         # Check if input is 2D (H, W)

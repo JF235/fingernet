@@ -228,10 +228,6 @@ class FingerNet(nn.Module):
             'minutiae_score': mnt_s,
         }
 
-    def time(self, x: torch.Tensor):
-        """Alias for ``forward(x, profile=True)``."""
-        return self.forward(x, profile=True)
-
 def get_fingernet_core(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNet:
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Weights file not found at: {weights_path}")

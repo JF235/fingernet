@@ -126,9 +126,7 @@ int main(int argc, char** argv) {
         auto xi = fnpost::argmax_plane(mx.as<float>(), 8, h, w);
         auto yi = fnpost::argmax_plane(my.as<float>(), 8, h, w);
         // C
-        auto orif = fnpost::orientation_field(oi.data(), h, w);
-        std::vector<uint8_t> orip(HW);
-        for (int k = 0; k < HW; ++k) orip[k] = (uint8_t)std::lround(orif[k]*180.0/fnpost::PI + 90.0);
+        auto orip = fnpost::orientation_png(oi.data(), h, w);
         { Array r = fnpy::load(F("ori_png", i)); cmp_u8(orip, r.as<uint8_t>(), C_orip); }
         // D
         auto en = fnpost::enhanced_u8(enh.as<float>(), H, W);

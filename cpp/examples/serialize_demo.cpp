@@ -52,9 +52,7 @@ int main(int argc, char** argv) {
         auto cleaned = fnpost::binarize_mask_fast(seg.as<float>(), h, w);
         auto mask = fnpost::mask_up_u8(cleaned.data(), h, w);
         auto qual = fnpost::quality_u8(seg.as<float>(), h, w);
-        auto orif = fnpost::orientation_field(oi.data(), h, w);
-        std::vector<uint8_t> orip(HW);
-        for (int k = 0; k < HW; ++k) orip[k] = (uint8_t)std::lround(orif[k] * 180.0 / fnpost::PI + 90.0);
+        auto orip = fnpost::orientation_png(oi.data(), h, w);
         auto en = fnpost::enhanced_u8(enh.as<float>(), H, W);
         std::vector<float> masked(hw);
         for (int k = 0; k < hw; ++k) masked[k] = ms.as<float>()[k] * cleaned[k];

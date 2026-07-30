@@ -72,24 +72,21 @@ struct SerializeNode : arandu::ICpuScript<FnetProducts, Written> {
             const FnetProducts& b = in[i]; const RawImage& r = *b.raw;
             if (out == "none") { outv[i] = Written{r.id, (int)b.minutiae->size()}; continue; }  // I/O-isolation
             int oh = r.orig_h, ow = r.orig_w, W = r.W;
-            const auto& of = *b.orientation_field;
-            std::vector<uint8_t> orip(of.size());
-            for (size_t k = 0; k < of.size(); ++k)
-                orip[k] = (uint8_t)std::lround(of[k] * 180.0 / fnpost::PI + 90.0);
+            // Quantised from the coarse index plane, not from the [H,W] float field:
+            // both derive from the same bins through the same expression, and deciding
+            // the byte per cell is 64x fewer lround calls (5.3 -> 0.5 ms/image).
             save("enhanced", r.id, *b.enhanced_image, W, oh, ow);
             save("mask", r.id, *b.segmentation_mask, W, oh, ow);
             save("quality", r.id, *b.quality, W, oh, ow);
-            save("ori", r.id, orip, W, oh, ow);
+            save("ori", r.id, fnpost::orientation_png(r.orientation_index.data(), r.h, r.w), W, oh, ow);
             save_min("minutiae", r.id, *b.minutiae);
             if (b.enhanced_image_mod) {
                 // ori_mod is the mask times a primitive, so it is derived here rather
                 // than carried; enhanced_mod is not (see enhanced_masked_u8).
-                auto cup = fnpost::nearest_up(b.cleaned->data(), r.h, r.w);
-                std::vector<uint8_t> orip_mod(of.size());
-                for (size_t k = 0; k < of.size(); ++k)
-                    orip_mod[k] = (uint8_t)std::lround(of[k] * cup[k] * 180.0 / fnpost::PI + 90.0);
                 save("enhanced_mod", r.id, *b.enhanced_image_mod, W, oh, ow);
-                save("ori_mod", r.id, orip_mod, W, oh, ow);
+                save("ori_mod", r.id,
+                     fnpost::orientation_png(r.orientation_index.data(), r.h, r.w, b.cleaned->data()),
+                     W, oh, ow);
             }
             outv[i] = Written{r.id, (int)b.minutiae->size()};
         }

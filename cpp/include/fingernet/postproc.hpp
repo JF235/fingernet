@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <vector>
 
@@ -110,6 +111,22 @@ inline std::vector<uint8_t> mask_up_u8(const float* cleaned, int h, int w) {
     return out;
 }
 
+// A coarse [h,w] byte plane -> [H,W], one memset per 8-pixel row of each block.
+// Every coarse->full product is nearest-neighbour x8, so anything whose value is
+// decided per CELL should be decided there and expanded here, rather than recomputed
+// for all 64 pixels of the block.
+inline std::vector<uint8_t> expand_u8(const uint8_t* coarse, int h, int w) {
+    const int H = h * 8, W = w * 8;
+    std::vector<uint8_t> out(static_cast<size_t>(H) * W);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t v = coarse[static_cast<size_t>(y) * w + x];
+            for (int dy = 0; dy < 8; ++dy)
+                std::memset(out.data() + static_cast<size_t>(y * 8 + dy) * W + x * 8, v, 8);
+        }
+    return out;
+}
+
 // cleaned coarse -> float [H,W] nearest-up (reused by _mod outputs)
 inline std::vector<float> nearest_up(const float* src, int h, int w) {
     int H = h * 8, W = w * 8;
@@ -127,29 +144,36 @@ inline std::vector<float> nearest_up(const float* src, int h, int w) {
 // *255 truncation boundary and flip by +-1 vs torch (float accumulation order);
 // this is below FingerNet's own run-to-run reproducibility on the quality map.
 inline std::vector<uint8_t> quality_u8(const float* seg, int h, int w) {
-    int H = h * 8, W = w * 8;
+    const int H = h * 8, W = w * 8;
     std::vector<uint8_t> out(static_cast<size_t>(H) * W);
     const float scale = 1.0f / 8.0f;
+    // sx/x0/x1/wx depend on X alone, so computing them inside the Y loop redid the
+    // whole column table H times (and std::floor is a libm call). Hoisted: same
+    // values, same order, byte-identical -- 10.8 -> 3.1 ms per 768x800 image,
+    // verified 0 bytes differing over the 64-image reference dump.
+    std::vector<int> x0s(W), x1s(W);
+    std::vector<float> wxs(W);
+    for (int X = 0; X < W; ++X) {
+        float sx = (static_cast<float>(X) + 0.5f) * scale - 0.5f;
+        if (sx < 0) sx = 0;
+        int x0 = static_cast<int>(std::floor(sx));
+        x0s[X] = x0; wxs[X] = sx - x0; x1s[X] = std::min(x0 + 1, w - 1);
+    }
     for (int Y = 0; Y < H; ++Y) {
         float sy = (static_cast<float>(Y) + 0.5f) * scale - 0.5f;
         if (sy < 0) sy = 0;
         int y0 = static_cast<int>(std::floor(sy));
         float wy = sy - y0;
         int y1 = std::min(y0 + 1, h - 1);
+        const float* r0 = seg + static_cast<size_t>(y0) * w;
+        const float* r1 = seg + static_cast<size_t>(y1) * w;
+        uint8_t* o = out.data() + static_cast<size_t>(Y) * W;
         for (int X = 0; X < W; ++X) {
-            float sx = (static_cast<float>(X) + 0.5f) * scale - 0.5f;
-            if (sx < 0) sx = 0;
-            int x0 = static_cast<int>(std::floor(sx));
-            float wx = sx - x0;
-            int x1 = std::min(x0 + 1, w - 1);
-            float p00 = seg[static_cast<size_t>(y0) * w + x0];
-            float p01 = seg[static_cast<size_t>(y0) * w + x1];
-            float p10 = seg[static_cast<size_t>(y1) * w + x0];
-            float p11 = seg[static_cast<size_t>(y1) * w + x1];
-            float top = p00 * (1 - wx) + p01 * wx;
-            float bot = p10 * (1 - wx) + p11 * wx;
-            float v = top * (1 - wy) + bot * wy;
-            out[static_cast<size_t>(Y) * W + X] = to_u8_trunc(v * 255.0f);
+            const int x0 = x0s[X], x1 = x1s[X];
+            const float wx = wxs[X];
+            float top = r0[x0] * (1 - wx) + r0[x1] * wx;
+            float bot = r1[x0] * (1 - wx) + r1[x1] * wx;
+            o[X] = to_u8_trunc((top * (1 - wy) + bot * wy) * 255.0f);
         }
     }
     return out;
@@ -164,6 +188,21 @@ inline std::vector<float> orientation_field(const int32_t* ori_idx, int h, int w
     std::vector<float> coarse(static_cast<size_t>(h) * w);
     for (size_t i = 0; i < coarse.size(); ++i) coarse[i] = bin_to_angle(ori_idx[i]);
     return nearest_up(coarse.data(), h, w);
+}
+
+// The orientation PNG's byte: degrees + 90, optionally masked. The field is constant
+// over each 8x8 block, so the byte is decided once per CELL and expanded -- 9,600
+// lround calls per 768x800 image instead of 614,400. Byte-identical to quantising the
+// [H,W] float field (0 differing over the reference dump); the float multiply by
+// `cleaned` is kept in float for that reason. `cleaned` null => unmasked.
+inline std::vector<uint8_t> orientation_png(const int32_t* ori_idx, int h, int w,
+                                            const float* cleaned = nullptr) {
+    std::vector<uint8_t> cell(static_cast<size_t>(h) * w);
+    for (size_t i = 0; i < cell.size(); ++i) {
+        float a = bin_to_angle(ori_idx[i]) * (cleaned ? cleaned[i] : 1.0f);
+        cell[i] = static_cast<uint8_t>(std::lround(a * 180.0 / PI + 90.0));
+    }
+    return expand_u8(cell.data(), h, w);
 }
 
 // ---- Block D: enhanced image ----------------------------------------------

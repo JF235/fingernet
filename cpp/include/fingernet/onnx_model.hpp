@@ -40,11 +40,19 @@ struct FnetOnnxConfig {
     // planes agree 99.3-99.9% (torch-cuda and ORT-cuda each landing somewhere in that
     // band, differently); with use_tf32=0 + HEURISTIC they agree 100.000% and the
     // float maps to 7.6e-6. So: leave it on to extract, turn it off to compare.
+    //
+    // KNOWN LIMIT, measured: with tf32=0, cuDNN's heuristic asks for a 33 GB workspace
+    // on one Conv of a batch-8 512x512 forward. A single actor survives it; two
+    // concurrent Run calls on the same session do not, and the arena aborts the
+    // process. So the oracle regime needs model_actors=1 (full_graph: --actors 1).
+    // cudnn_conv_use_max_workspace=0 does NOT cap it -- tried, same request.
     bool tf32 = true;
     // cuDNN algorithm choice. ORT's own default is EXHAUSTIVE (autotune), which is
     // torch's cudnn.benchmark=True -- and api.py deliberately leaves that OFF because
     // autotune picks per-run algorithms whose reduction order differs. HEURISTIC is
-    // the matching setting, and it also makes this tier reproducible run to run.
+    // the matching setting. It does NOT buy run-to-run reproducibility: measured, two
+    // runs of the same binary over 200 BN48k images agree on 178/200 .min files with
+    // TF32 on, at any batch size. Reproducibility here needs use_tf32=0.
     std::string conv_algo = "HEURISTIC";  // HEURISTIC | EXHAUSTIVE | DEFAULT
     // ORT's intra-op pool, which runs the nodes the CUDA EP leaves on the host: 15 of
     // the 423, plus the 4 Memcpy that stitch the two sides. Worth 3.5% on CUDA (6.57 ->
@@ -90,9 +98,11 @@ public:
         // field in OrtCUDAProviderOptions, and it is the setting that decides parity.
         auto append_cuda = [&] {
             Ort::CUDAProviderOptions o;
-            o.Update({{"device_id", std::to_string(cfg_.device_id)},
-                      {"cudnn_conv_algo_search", cfg_.conv_algo},
-                      {"use_tf32", cfg_.tf32 ? "1" : "0"}});
+            std::unordered_map<std::string, std::string> m{
+                {"device_id", std::to_string(cfg_.device_id)},
+                {"cudnn_conv_algo_search", cfg_.conv_algo},
+                {"use_tf32", cfg_.tf32 ? "1" : "0"}};
+            o.Update(m);
             so.AppendExecutionProvider_CUDA_V2(*o);
         };
         if (cfg_.provider == "cuda") {

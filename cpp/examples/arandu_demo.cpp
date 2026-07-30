@@ -61,13 +61,18 @@ int main(int argc, char** argv) {
     for (int i = 0; i < N; ++i) {
         auto r = std::make_shared<RawImage>();
         r->h = h; r->w = w; r->H = H; r->W = W; r->threshold = thr;
+        // The dump predates the argmax moving into the ONNX graph, so it still holds
+        // the float channel stacks; reduce them the way the graph now does.
+        auto amax = [&](const char* p, int C) {
+            return fnpost::argmax_plane(load_vec(R(p, i)).data(), C, h, w);
+        };
         r->segmentation = load_vec(R("segmentation", i));
-        r->orientation = load_vec(R("orientation", i));
         r->enhanced_real = load_vec(R("enhanced_real", i));
-        r->minutiae_orientation = load_vec(R("minutiae_orientation", i));
-        r->minutiae_x_offset = load_vec(R("minutiae_x_offset", i));
-        r->minutiae_y_offset = load_vec(R("minutiae_y_offset", i));
         r->minutiae_score = load_vec(R("minutiae_score", i));
+        r->orientation_index = amax("orientation", 90);
+        r->minutiae_orientation_index = amax("minutiae_orientation", 180);
+        r->minutiae_x_index = amax("minutiae_x_offset", 8);
+        r->minutiae_y_index = amax("minutiae_y_offset", 8);
         Bundle b; b.raw = r;
         input.emplace_back(std::move(b));
     }

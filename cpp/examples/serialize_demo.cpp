@@ -43,16 +43,23 @@ int main(int argc, char** argv) {
         fnpy::Array my = fnpy::load(R("minutiae_y_offset", i));
         fnpy::Array ms = fnpy::load(R("minutiae_score", i));
 
+        // The dump predates the argmax moving into the ONNX graph, so it still holds
+        // the float channel stacks; reduce them the way the graph now does.
+        auto oi = fnpost::argmax_plane(ori.as<float>(), 90, h, w);
+        auto mi = fnpost::argmax_plane(mo.as<float>(), 180, h, w);
+        auto xi = fnpost::argmax_plane(mx.as<float>(), 8, h, w);
+        auto yi = fnpost::argmax_plane(my.as<float>(), 8, h, w);
+
         auto cleaned = fnpost::binarize_mask_fast(seg.as<float>(), h, w);
         auto mask = fnpost::mask_up_u8(cleaned.data(), h, w);
         auto qual = fnpost::quality_u8(seg.as<float>(), h, w);
-        auto orif = fnpost::orientation_field(ori.as<float>(), 90, h, w);
+        auto orif = fnpost::orientation_field(oi.data(), h, w);
         std::vector<uint8_t> orip(HW);
         for (int k = 0; k < HW; ++k) orip[k] = (uint8_t)std::lround(orif[k] * 180.0 / fnpost::PI + 90.0);
         auto en = fnpost::enhanced_u8(enh.as<float>(), H, W);
         std::vector<float> masked(hw);
         for (int k = 0; k < hw; ++k) masked[k] = ms.as<float>()[k] * cleaned[k];
-        auto mnt = fnpost::detect_minutiae(masked.data(), mo.as<float>(), mx.as<float>(), my.as<float>(), h, w, thr);
+        auto mnt = fnpost::detect_minutiae(masked.data(), mi.data(), xi.data(), yi.data(), h, w, thr);
 
         std::string id = std::to_string(i);
         fnpng::write_gray(out + "/enhanced/" + id + ".png", en.data(), H, W);

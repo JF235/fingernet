@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
 
     FStat A_clean{}, C_orif{};
     U8Stat A_mask{}, B_qual{}, C_orip{}, D_enh{}, F_enhm{};
-    long e_exact=0,e_ref=0,e_cpp=0, u_exact=0,u_ref=0,u_cpp=0;
+    long e_exact=0,e_ref=0,e_cpp=0;
     int worst_q_img = -1; long worst_q = -1;
 
     auto R = [&](const char* pre, int i) { return dir + "/raw/" + pre + "_" + std::to_string(i) + ".npy"; };
@@ -120,8 +120,14 @@ int main(int argc, char** argv) {
         auto qual = fnpost::quality_u8(seg_i, h, w);
         { Array r = fnpy::load(F("quality", i)); long m0=B_qual.mism; cmp_u8(qual, r.as<uint8_t>(), B_qual);
           if (B_qual.mism-m0 > worst_q) { worst_q = B_qual.mism-m0; worst_q_img = i; } }
+        // The dump holds the float channel stacks; production gets their argmax from
+        // the ONNX graph. Reduce here so the comparison is block-for-block.
+        auto oi = fnpost::argmax_plane(ori.as<float>(), 90, h, w);
+        auto mi = fnpost::argmax_plane(mo.as<float>(), 180, h, w);
+        auto xi = fnpost::argmax_plane(mx.as<float>(), 8, h, w);
+        auto yi = fnpost::argmax_plane(my.as<float>(), 8, h, w);
         // C
-        auto orif = fnpost::orientation_field(ori.as<float>(), 90, h, w);
+        auto orif = fnpost::orientation_field(oi.data(), h, w);
         std::vector<uint8_t> orip(HW);
         for (int k = 0; k < HW; ++k) orip[k] = (uint8_t)std::lround(orif[k]*180.0/fnpost::PI + 90.0);
         { Array r = fnpy::load(F("ori_png", i)); cmp_u8(orip, r.as<uint8_t>(), C_orip); }
@@ -129,23 +135,16 @@ int main(int argc, char** argv) {
         auto en = fnpost::enhanced_u8(enh.as<float>(), H, W);
         { Array r = fnpy::load(F("enhanced_image", i)); cmp_u8(en, r.as<uint8_t>(), D_enh); }
         // F2
-        auto cleaned_up = fnpost::nearest_up(cleaned.data(), h, w);
-        std::vector<float> enh_mod(HW);
-        for (int k = 0; k < HW; ++k) enh_mod[k] = enh.as<float>()[k] * cleaned_up[k];
-        auto enm = fnpost::enhanced_u8(enh_mod.data(), H, W);
+        auto enm = fnpost::enhanced_masked_u8(enh.as<float>(), cleaned.data(), h, w);
         { Array r = fnpy::load(F("enhanced_image_mod", i)); cmp_u8(enm, r.as<uint8_t>(), F_enhm); }
         // E
         std::vector<float> masked(hw);
         for (int k = 0; k < hw; ++k) masked[k] = ms.as<float>()[k] * cleaned[k];
-        auto mnt = fnpost::detect_minutiae(masked.data(), mo.as<float>(), mx.as<float>(), my.as<float>(), h, w, threshold);
+        auto mnt = fnpost::detect_minutiae(masked.data(), mi.data(), xi.data(), yi.data(), h, w, threshold);
         auto rows = fnmin::to_min_rows(mnt);
         if (write_min) fnmin::write_min(dir + "/cpp_min/min_" + std::to_string(i) + ".min", rows);
         { auto ref = read_min_txt(dir + "/ref/min/min_" + std::to_string(i) + ".txt");
           cmp_min(rows, ref, e_exact); e_ref += (long)ref.size(); e_cpp += (long)rows.size(); }
-        auto mnt_u = fnpost::detect_minutiae(ms.as<float>(), mo.as<float>(), mx.as<float>(), my.as<float>(), h, w, threshold);
-        auto rows_u = fnmin::to_min_rows(mnt_u);
-        { auto ref = read_min_txt(dir + "/ref/min/min_unmod_" + std::to_string(i) + ".txt");
-          cmp_min(rows_u, ref, u_exact); u_ref += (long)ref.size(); u_cpp += (long)rows_u.size(); }
 
         if ((i+1) % 64 == 0) { printf("\r  %d/%d", i+1, N); fflush(stdout); }
     }
@@ -159,6 +158,5 @@ int main(int argc, char** argv) {
     printf("D enhanced_image     (u8) : max|d|=%d  mism=%ld/%ld  imgs_exact=%ld/%d\n", D_enh.maxabs, D_enh.mism, D_enh.n, D_enh.imgs_exact, N);
     printf("F enhanced_image_mod (u8) : max|d|=%d  mism=%ld/%ld  imgs_exact=%ld/%d\n", F_enhm.maxabs, F_enhm.mism, F_enhm.n, F_enhm.imgs_exact, N);
     printf("E minutiae      : exact=%ld/%ld (%.4f%%)  [cpp=%ld ref=%ld]\n", e_exact, e_ref, pct(e_exact, e_ref), e_cpp, e_ref);
-    printf("E minutiae_unmod: exact=%ld/%ld (%.4f%%)  [cpp=%ld ref=%ld]\n", u_exact, u_ref, pct(u_exact, u_ref), u_cpp, u_ref);
     return 0;
 }

@@ -37,10 +37,14 @@ struct LoadNode : arandu::ICpuScript<PathItem, InputImage> {
     }
 };
 
-// serialize(sink): crop maps to orig, write the 8 --full artifacts.
+// serialize(sink): crop maps to orig, write the artifacts api.py writes -- the five
+// defaults (minutiae/ enhanced/ mask/ ori/ quality/), plus enhanced_mod/ and ori_mod/
+// when `full`. Same set, same names, same directory layout, so the two extractions
+// diff directly.
 struct SerializeNode : arandu::ICpuScript<Bundle, Written> {
     std::string out;
-    explicit SerializeNode(std::string o) : out(std::move(o)) {}
+    bool full = false;
+    explicit SerializeNode(std::string o, bool f = false) : out(std::move(o)), full(f) {}
     static std::vector<uint8_t> crop(const std::vector<uint8_t>& s, int W, int oh, int ow) {
         std::vector<uint8_t> d(static_cast<size_t>(oh) * ow);
         for (int y = 0; y < oh; ++y)
@@ -68,20 +72,24 @@ struct SerializeNode : arandu::ICpuScript<Bundle, Written> {
             if (out == "none") { outv[i] = Written{r.id, (int)b.minutiae->size()}; continue; }  // I/O-isolation
             int oh = r.orig_h, ow = r.orig_w, W = r.W;
             const auto& of = *b.orientation_field;
-            auto cup = fnpost::nearest_up(b.cleaned->data(), r.h, r.w);
-            std::vector<uint8_t> orip(of.size()), orip_mod(of.size());
-            for (size_t k = 0; k < of.size(); ++k) {
+            std::vector<uint8_t> orip(of.size());
+            for (size_t k = 0; k < of.size(); ++k)
                 orip[k] = (uint8_t)std::lround(of[k] * 180.0 / fnpost::PI + 90.0);
-                orip_mod[k] = (uint8_t)std::lround(of[k] * cup[k] * 180.0 / fnpost::PI + 90.0);
-            }
             save("enhanced", r.id, *b.enhanced_image, W, oh, ow);
-            save("enhanced_mod", r.id, *b.enhanced_image_mod, W, oh, ow);
             save("mask", r.id, *b.segmentation_mask, W, oh, ow);
             save("quality", r.id, *b.quality, W, oh, ow);
             save("ori", r.id, orip, W, oh, ow);
-            save("ori_mod", r.id, orip_mod, W, oh, ow);
             save_min("minutiae", r.id, *b.minutiae);
-            save_min("minutiae_unmod", r.id, *b.minutiae_unmod);
+            if (full) {
+                // ori_mod is the mask times a primitive, so it is derived here rather
+                // than carried; enhanced_mod is not (see enhanced_masked_u8).
+                auto cup = fnpost::nearest_up(b.cleaned->data(), r.h, r.w);
+                std::vector<uint8_t> orip_mod(of.size());
+                for (size_t k = 0; k < of.size(); ++k)
+                    orip_mod[k] = (uint8_t)std::lround(of[k] * cup[k] * 180.0 / fnpost::PI + 90.0);
+                save("enhanced_mod", r.id, *b.enhanced_image_mod, W, oh, ow);
+                save("ori_mod", r.id, orip_mod, W, oh, ow);
+            }
             outv[i] = Written{r.id, (int)b.minutiae->size()};
         }
     }

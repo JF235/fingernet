@@ -1,6 +1,10 @@
 """
 Converte o modelo FingerNet (core) para ONNX, com eixos dinâmicos (batch/H/W).
 
+O ONNX existe para alimentar o pipeline C++ (cpp/include/fingernet/onnx_model.hpp),
+e esse consumidor nunca lê os 286 canais grossos de orientação/offset: só o argmax
+deles. Então o argmax vai no grafo -- ver ARGMAX_OUTPUTS.
+
 Uso:
     python convert_to_onnx.py --weights <pesos.pth> --output <saida.onnx>
 """
@@ -19,9 +23,25 @@ from fingernet.model import FingerNet
 #: Shape só para o tracing -- os eixos batch/H/W são dinâmicos no grafo final.
 TRACE_SHAPE = (1, 1, 400, 400)
 
+#: Saídas reduzidas a argmax no grafo, e o nome do plano de índices de cada uma.
+#: São as quatro cujo pós-processamento é "qual canal ganhou": orientação (90 bins),
+#: orientação da minúcia (180) e os dois offsets sub-bloco (8 cada). Transferir os
+#: canais e reduzir no host custava 4.4 MB e 0.84 ms por imagem de 512x512 -- 22% do
+#: forward em TRT fp16. ONNX ArgMax usa select_last_index=0, o mesmo primeiro-máximo
+#: que fnpost::argmax_channels, então os índices são idênticos aos do host.
+ARGMAX_OUTPUTS = {
+    'orientation': 'orientation_index',
+    'minutiae_orientation': 'minutiae_orientation_index',
+    'minutiae_x_offset': 'minutiae_x_index',
+    'minutiae_y_offset': 'minutiae_y_index',
+}
 
-class _TupleOutput(nn.Module):
-    """ONNX não aceita dict como saída; achata para tuple na ordem de OUTPUTS."""
+#: Nomes das saídas do grafo, na ordem de FingerNet.OUTPUTS.
+OUTPUT_NAMES = [ARGMAX_OUTPUTS.get(n, n) for n in FingerNet.OUTPUTS]
+
+
+class _GraphOutput(nn.Module):
+    """ONNX não aceita dict como saída; achata para tuple e reduz ARGMAX_OUTPUTS."""
 
     def __init__(self, model: FingerNet):
         super().__init__()
@@ -29,7 +49,11 @@ class _TupleOutput(nn.Module):
 
     def forward(self, x: torch.Tensor):
         out = self.model(x)
-        return tuple(out[name] for name in FingerNet.OUTPUTS)
+        return tuple(
+            torch.argmax(out[name], dim=1).to(torch.int32) if name in ARGMAX_OUTPUTS
+            else out[name]
+            for name in FingerNet.OUTPUTS
+        )
 
 
 def convert_to_onnx(weights_path: str, output_path: str, opset_version: int = 17):
@@ -44,7 +68,7 @@ def convert_to_onnx(weights_path: str, output_path: str, opset_version: int = 17
     model.load_state_dict(torch.load(weights_path, map_location='cpu'))
     model.eval()
 
-    output_names = list(FingerNet.OUTPUTS)
+    output_names = list(OUTPUT_NAMES)
     dynamic_axes = {
         'input_image': {0: 'batch_size', 2: 'height', 3: 'width'},
         **{name: {0: 'batch_size'} for name in output_names}
@@ -54,7 +78,7 @@ def convert_to_onnx(weights_path: str, output_path: str, opset_version: int = 17
     # gera um grafo inválido p/ este modelo -- sort topológico/initializer dup).
     print(f"Exportando para: {output_path}")
     torch.onnx.export(
-        _TupleOutput(model),
+        _GraphOutput(model),
         torch.randn(*TRACE_SHAPE),
         output_path,
         export_params=True,

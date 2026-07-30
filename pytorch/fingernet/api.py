@@ -396,15 +396,18 @@ def run_inference(
     """
     image_paths = find_image_paths(input_path, recursive)
 
-    # Determine the base path for preserving directory structure
-    # If input_path is a directory, use it as base
-    # If it's a file or list, use its parent directory
+    # Base path for preserving directory structure under output_path.
+    #
+    # For a directory, that is the directory. For a .txt list it is NOT the list's own
+    # directory: the list can live anywhere, and a base the images are not under makes
+    # save_results' relpath emit "../.." — every product then lands OUTSIDE output_path,
+    # and because the five per-image products differ only by their leading directory,
+    # they collapse onto one filename and overwrite each other. Silent 4/5 data loss.
+    # The common ancestor of the images themselves is the base that cannot do that.
     if os.path.isdir(input_path):
         input_base_path = input_path
-    elif os.path.isfile(input_path):
-        input_base_path = os.path.dirname(input_path)
     else:
-        input_base_path = None
+        input_base_path = os.path.commonpath([os.path.dirname(p) for p in image_paths])
 
     # Collect all config into one dict for convenience
     config = locals()

@@ -1,6 +1,6 @@
 // I/O arandu nodes (no ONNX dependency): LoadNode reads a PNG into InputImage;
-// SerializeNode writes the 8 production artifacts (PNG + .min). Kept separate
-// so both the full graph and stage benchmarks can share them.
+// SerializeNode writes the production artifacts (PNG + .min). Kept separate so both
+// the full graph and the stage benchmarks can share them.
 #pragma once
 #include <cmath>
 #include <filesystem>
@@ -41,12 +41,8 @@ struct LoadNode : arandu::ICpuScript<PathItem, InputImage> {
 // defaults (minutiae/ enhanced/ mask/ ori/ quality/), plus enhanced_mod/ and ori_mod/
 // when the producer made them. Same set, same names, same directory layout, so the two extractions
 // diff directly.
-// Whether the _mod pair is written is read off the DATA, not off a second flag.
-// There used to be two independent `full` booleans -- this node's and the producer's
-// (PostprocNode/EnhancedNode) -- and disagreeing them dereferenced a null
-// enhanced_image_mod: exactly the build()-passes-runtime-fails failure the edge types
-// were introduced to remove, reintroduced through a constructor argument. The producer
-// now decides alone, and this node writes what it was given.
+// The _mod pair is written iff the producer made it: there is no second flag here to
+// disagree with the producer's, which is how a null deref used to get past build().
 struct SerializeNode : arandu::ICpuScript<FnetProducts, Written> {
     std::string out;
     explicit SerializeNode(std::string o) : out(std::move(o)) {}

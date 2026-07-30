@@ -26,32 +26,30 @@ inline uint8_t to_u8_trunc(float v) {
     return static_cast<uint8_t>(v);  // truncation toward zero
 }
 
-// argmax over the channel dim at a fixed (y,x); returns the FIRST maximal index.
+// argmax over the channel dim, per cell; returns the FIRST maximal index.
 //
-// The pipeline does NOT call this: the four argmaxes the decode needs are computed
-// inside the ONNX graph (ONNX ArgMax defaults to select_last_index=0, i.e. the same
-// first-maximal rule), which is what lets the model return 4 index planes instead of
-// 286 float channels. It stays here because the parity harness reads the Python dump
-// of those float channels and has to reduce them itself to compare like with like.
-inline int argmax_channels(const float* t, int C, int hw, int idx) {
-    int best = 0;
-    float bv = t[idx];  // channel 0
-    for (int c = 1; c < C; ++c) {
-        float v = t[static_cast<size_t>(c) * hw + idx];
-        if (v > bv) { bv = v; best = c; }
-    }
-    return best;
-}
-
-// The full-plane form, for the same reason.
+// The pipeline does NOT call this: the decode's four argmaxes run inside the ONNX
+// graph (ONNX ArgMax defaults to select_last_index=0, the same first-maximal rule).
+// It stays here because the parity harness reads the Python dump of the float channel
+// stacks, which predates that change, and has to reduce them itself to compare like
+// with like.
 inline std::vector<int32_t> argmax_plane(const float* t, int C, int h, int w) {
-    int hw = h * w;
+    const int hw = h * w;
     std::vector<int32_t> idx(static_cast<size_t>(hw));
-    for (int i = 0; i < hw; ++i) idx[i] = argmax_channels(t, C, hw, i);
+    for (int i = 0; i < hw; ++i) {
+        int best = 0;
+        float bv = t[i];  // channel 0
+        for (int c = 1; c < C; ++c) {
+            float v = t[static_cast<size_t>(c) * hw + i];
+            if (v > bv) { bv = v; best = c; }
+        }
+        idx[i] = best;
+    }
     return idx;
 }
 
-// Both angle decodes: bin -> radians. 180 bins of 2 degrees, -89 being bin 0's centre.
+// Bin -> radians, for both angle heads: the orientation field's 90 bins and the
+// minutia's 180. Both are 2 degrees wide with -89 at bin 0's centre.
 inline float bin_to_angle(int bin) {
     return static_cast<float>((bin * 2.0 - 89.0) * PI / 180.0);
 }
@@ -160,19 +158,12 @@ inline std::vector<uint8_t> quality_u8(const float* seg, int h, int w) {
 // ---- Block C: orientation field -------------------------------------------
 // ori_idx[h,w] (argmax bins, from the graph) -> nearest-up x8 -> radians [H,W]
 inline std::vector<float> orientation_field(const int32_t* ori_idx, int h, int w) {
-    int H = h * 8, W = w * 8;
-    std::vector<float> out(static_cast<size_t>(H) * W);
-    // One angle per coarse cell, written to its whole 8x8 block: 64x fewer
-    // bin_to_angle calls than the per-pixel form, and the same bytes out.
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-            float a = bin_to_angle(ori_idx[static_cast<size_t>(y) * w + x]);
-            for (int dy = 0; dy < 8; ++dy) {
-                float* row = out.data() + static_cast<size_t>(y * 8 + dy) * W + x * 8;
-                for (int dx = 0; dx < 8; ++dx) row[dx] = a;
-            }
-        }
-    return out;
+    // Decode once per coarse cell, then let nearest_up own the x8 rule (as every
+    // other coarse->full product does): 64x fewer bin_to_angle calls than decoding
+    // per pixel, at the cost of one [h*w] temporary.
+    std::vector<float> coarse(static_cast<size_t>(h) * w);
+    for (size_t i = 0; i < coarse.size(); ++i) coarse[i] = bin_to_angle(ori_idx[i]);
+    return nearest_up(coarse.data(), h, w);
 }
 
 // ---- Block D: enhanced image ----------------------------------------------

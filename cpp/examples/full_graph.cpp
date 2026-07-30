@@ -6,9 +6,11 @@
 //
 //   full_graph --onnx M.onnx --images DIR|LIST.txt --out DIR|none [flags]
 //
-//   --exec pipeline|serial|cpu   default pipeline; `cpu` is the same
-//                                PipelineExecutor forced onto the CPU fallback,
-//                                which is what the retired StreamExecutor did
+//   --exec pipeline|serial       default pipeline. To force the model phase onto its
+//                                cpu fallback, use --streams 0: `--exec cpu` used to
+//                                mean the same thing by a different conjunct of
+//                                arandu::resolve(), and two spellings of one mode is
+//                                how the printout below came to disagree with the run
 //   --provider cuda|tensorrt|cpu, --fp16, --engine-cache DIR   model backend
 //   --no-tf32 --conv-algo HEURISTIC|EXHAUSTIVE  the two parity knobs (see onnx_model.hpp)
 //   --n N --batch B --threads T --actors A --depth D --warmup W --streams S
@@ -133,7 +135,6 @@ int main(int argc, char** argv) {
         items.swap(mine);
     }
     if (items.empty()) die("no images");
-    std::vector<std::any> input(items.begin(), items.end());
 
     printf("graph: %zu imgs (shard %d/%d), exec=%s, provider=%s%s, T=%d, B=%d, actors=%d, "
            "depth=%d, streams=%d, warmup=%d, thr=%.3f, tf32=%d, algo=%s%s\n",
@@ -143,13 +144,12 @@ int main(int argc, char** argv) {
 
     // The padded shape of the first image: the model needs it before the session
     // exists, for the TensorRT profile and the transport declaration.
-    int nh = 0, nw = 0;
+    InputImage probe;
     {
-        std::vector<InputImage> probe(1);
         arandu::RunCtx pc;
-        LoadNode{}.run(std::span<const PathItem>(&items[0], 1), probe, pc);
-        nh = probe[0].H; nw = probe[0].W;
+        LoadNode{}.run(std::span<const PathItem>(&items[0], 1), std::span<InputImage>(&probe, 1), pc);
     }
+    const int nh = probe.H, nw = probe.W;
     printf("padded shape: %dx%d\n", nh, nw);
 
     auto tl = clk::now();
@@ -174,15 +174,20 @@ int main(int argc, char** argv) {
     arandu::Graph g = gb.build();
 
     // Warmup on the first image, repeated: pays the CUDA/cuDNN/arena cost (and, for
-    // TensorRT, the engine build) before the clock starts.
+    // TensorRT, the engine build) before the clock starts. The probe already decoded
+    // that image, so this costs no PNG reads.
     if (a.warmup > 0) {
-        std::vector<PathItem> wp(std::min<size_t>(a.warmup, items.size()), items[0]);
-        std::vector<InputImage> wi(wp.size());
-        arandu::RunCtx wc; LoadNode{}.run(wp, wi, wc);
+        std::vector<InputImage> wi(a.warmup, probe);
         std::vector<FnetRaw> wb(wi.size());
+        arandu::RunCtx wc;
         model->infer(wi, wb, wc);
     }
     double t_warm = secs(tl, clk::now()) - t_sess;
+
+    // Built last: the source phase consumes it, and everything above still needed
+    // `items` (the shape probe reads items[0], and moving out of it would empty that).
+    std::vector<std::any> input(std::make_move_iterator(items.begin()),
+                                std::make_move_iterator(items.end()));
 
     arandu::Profiler prof;
     arandu::ExecPolicy pol;
@@ -204,22 +209,23 @@ int main(int argc, char** argv) {
     pol.model_actors = a.actors;
     pol.profiler = (a.exec == "pipeline") ? &prof : nullptr;
 
-    printf("phases:");
-    for (const auto& p : g.phases) {
-        arandu::PhaseImpl impl = arandu::resolve(p, pol);
-        const char* k = impl == arandu::PhaseImpl::Model ? "MODEL"
-                      : impl == arandu::PhaseImpl::Join  ? "join" : "cpu";
-        printf("  %s=%s", p.name.c_str(), k);
+    // Printed from the FINAL policy, and only for the executor that consults it:
+    // SerialExecutor has no model runner, so resolve() would describe a run it is not
+    // doing. An earlier version printed before the executor branch could still change
+    // the policy, and cheerfully reported onnx=MODEL for a cpu-fallback run.
+    if (a.exec == "pipeline") {
+        printf("phases:");
+        for (const auto& p : g.phases)
+            printf("  %s=%s", p.name.c_str(),
+                   arandu::resolve(p, pol) == arandu::PhaseImpl::Model ? "MODEL" : "cpu");
+        printf("\n");
     }
-    printf("\n");
 
     auto t0 = clk::now();
     std::vector<std::any> res;
     if (a.exec == "pipeline") res = arandu::PipelineExecutor{pol}.run(g, input);
-    else if (a.exec == "cpu" || a.exec == "stream") {
-        pol.device = arandu::Device::Cpu;
-        res = arandu::PipelineExecutor{pol}.run(g, input);
-    } else res = arandu::SerialExecutor{}.run(g, input);
+    else if (a.exec == "serial") res = arandu::SerialExecutor{}.run(g, input);
+    else die("--exec wants pipeline or serial, got " + a.exec);
     double t_run = secs(t0, clk::now());
 
     long tot = 0;

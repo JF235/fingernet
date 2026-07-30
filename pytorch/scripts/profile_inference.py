@@ -215,7 +215,7 @@ def instrumented_step(
         )
 
     with gtimer.stage("post_orientation_field"):
-        ori_idx = torch.argmax(raw_outputs["orientation"], dim=1)
+        ori_idx = raw_outputs["orientation_index"]
         ori_idx_up = F.interpolate(
             ori_idx.unsqueeze(1).float(), scale_factor=8, mode="nearest"
         ).squeeze(1)

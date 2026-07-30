@@ -14,8 +14,10 @@
 #include <string>
 #include <vector>
 
+#include "arandu/arandu.hpp"
+#include "fingernet/arandu_nodes.hpp"
+#include "fingernet/fingernet.hpp"
 #include "fingernet/npy.hpp"       // the Python reference dump; not part of the pipeline
-#include "fingernet/pipeline.hpp"
 
 using namespace fnaru;
 
@@ -40,6 +42,21 @@ static std::vector<std::array<long,4>> read_min(const std::string& p) {
     return v;
 }
 
+// The two byte-identity gates below compare the same five products; only the reporting
+// differs (gate 1 wants the per-field breakdown, gate 3 a count).
+static bool products_equal(const FnetProducts& a, const FnetProducts& b) {
+    if (*a.segmentation_mask != *b.segmentation_mask || *a.quality != *b.quality ||
+        *a.orientation_field != *b.orientation_field ||
+        *a.enhanced_image != *b.enhanced_image ||
+        a.minutiae->size() != b.minutiae->size()) return false;
+    for (size_t k = 0; k < a.minutiae->size(); ++k) {
+        const auto& m1 = (*a.minutiae)[k]; const auto& m2 = (*b.minutiae)[k];
+        if (m1.x != m2.x || m1.y != m2.y || m1.angle != m2.angle || m1.score != m2.score)
+            return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "/storage/jcontreras/tmp_arandu_bench/refdump516";
     int N = argc > 2 ? std::atoi(argv[2]) : 64;
@@ -51,7 +68,9 @@ int main(int argc, char** argv) {
     printf("arandu postproc graph: %d imgs, chain mask->quality->ori->enhanced->minutiae\n", N);
 
     // build input Bundles
+    std::vector<FnetRaw> raws;
     std::vector<std::any> input;
+    raws.reserve(N);
     input.reserve(N);
     auto R = [&](const char* p, int i) { return dir + "/raw/" + p + "_" + std::to_string(i) + ".npy"; };
     for (int i = 0; i < N; ++i) {
@@ -69,7 +88,8 @@ int main(int argc, char** argv) {
         r->minutiae_orientation_index = amax("minutiae_orientation", 180);
         r->minutiae_x_index = amax("minutiae_x_offset", 8);
         r->minutiae_y_index = amax("minutiae_y_offset", 8);
-        input.emplace_back(FnetRaw{std::move(r)});
+        raws.push_back(FnetRaw{std::move(r)});
+        input.emplace_back(raws.back());
     }
 
     arandu::Graph g = build_postproc_graph();
@@ -95,8 +115,8 @@ int main(int argc, char** argv) {
     // (1) Serial == Pipeline, byte-for-byte (thread invariance)
     long dmask = 0, dqual = 0, dori = 0, denh = 0, dmnt = 0;
     for (int i = 0; i < N; ++i) {
-        const Bundle& a = std::any_cast<const Bundle&>(rs[i]);
-        const Bundle& b = std::any_cast<const Bundle&>(rp[i]);
+        const FnetProducts& a = std::any_cast<const FnetProducts&>(rs[i]);
+        const FnetProducts& b = std::any_cast<const FnetProducts&>(rp[i]);
         if (*a.segmentation_mask != *b.segmentation_mask) ++dmask;
         if (*a.quality != *b.quality) ++dqual;
         if (*a.orientation_field != *b.orientation_field) ++dori;
@@ -115,7 +135,7 @@ int main(int argc, char** argv) {
     long e_ok = 0, e_ref = 0, e_cpp = 0, q_mism = 0, en_mism = 0, mk_mism = 0;
     auto F = [&](const char* p, int i) { return dir + "/ref/" + p + "_" + std::to_string(i) + ".npy"; };
     for (int i = 0; i < N; ++i) {
-        const Bundle& a = std::any_cast<const Bundle&>(rs[i]);
+        const FnetProducts& a = std::any_cast<const FnetProducts&>(rs[i]);
         { fnpy::Array r = fnpy::load(F("quality", i)); for (size_t k=0;k<a.quality->size();++k) if ((*a.quality)[k]!=r.as<uint8_t>()[k]) ++q_mism; }
         { fnpy::Array r = fnpy::load(F("enhanced_image", i)); for (size_t k=0;k<a.enhanced_image->size();++k) if ((*a.enhanced_image)[k]!=r.as<uint8_t>()[k]) ++en_mism; }
         { fnpy::Array r = fnpy::load(F("segmentation_mask", i)); for (size_t k=0;k<a.segmentation_mask->size();++k) if ((*a.segmentation_mask)[k]!=r.as<uint8_t>()[k]) ++mk_mism; }
@@ -131,23 +151,11 @@ int main(int argc, char** argv) {
     // (3) The FUSED node vs the CHAIN. PostprocNode is a hand transcription of the five
     // node bodies, production runs the fused one, and every gate above exercises only
     // the chain -- so the code that actually ships had nothing checking it.
-    arandu::GraphBuilder fb;
-    fb.add<FnetRaw, FnetProducts>("postproc", std::make_shared<PostprocNode>(), {});
-    auto rf = arandu::SerialExecutor{}.run(fb.build(), input);
+    std::vector<FnetProducts> fused(N);
+    { arandu::RunCtx fc; PostprocNode{}.run(raws, fused, fc); }
     long fdiff = 0;
-    for (int i = 0; i < N; ++i) {
-        const FnetProducts& c = std::any_cast<const FnetProducts&>(rs[i]);
-        const FnetProducts& f = std::any_cast<const FnetProducts&>(rf[i]);
-        bool same = *c.segmentation_mask == *f.segmentation_mask && *c.quality == *f.quality &&
-                    *c.orientation_field == *f.orientation_field &&
-                    *c.enhanced_image == *f.enhanced_image &&
-                    c.minutiae->size() == f.minutiae->size();
-        for (size_t k = 0; same && k < c.minutiae->size(); ++k) {
-            const auto& m1 = (*c.minutiae)[k]; const auto& m2 = (*f.minutiae)[k];
-            same = m1.x == m2.x && m1.y == m2.y && m1.angle == m2.angle && m1.score == m2.score;
-        }
-        if (!same) ++fdiff;
-    }
+    for (int i = 0; i < N; ++i)
+        if (!products_equal(std::any_cast<const FnetProducts&>(rs[i]), fused[i])) ++fdiff;
     printf("[fused vs chain] differing images: %ld/%d  -> %s\n", fdiff, N,
            fdiff == 0 ? "BYTE-IDENTICAL" : "MISMATCH");
 

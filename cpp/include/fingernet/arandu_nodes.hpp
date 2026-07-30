@@ -1,8 +1,8 @@
-// FingerNet postproc blocks wrapped as arandu nodes (ICpuScript<Bundle,Bundle>),
-// item-pure (out[i] depends only on in[i]). The blocks are chained; each node
-// adds its output to a shared-ptr Bundle carrier so chaining copies stay cheap.
-// This is the plug-and-play adapter: arandu builds the graph, fingernet owns
-// the kernels. Requires the arandu headers on the include path.
+// FingerNet postproc blocks wrapped as arandu nodes, item-pure (out[i] depends only
+// on in[i]). The model emits FnetRaw; the blocks accumulate into a shared-ptr
+// FnetProducts carrier, so chaining copies stay cheap. This is the plug-and-play
+// adapter: arandu builds the graph, fingernet owns the kernels. Requires the arandu
+// headers on the include path.
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -19,9 +19,9 @@ namespace fnaru {
 //
 // Four of the seven are INDEX planes, not the float channel stacks the network
 // produces: orientation (90 bins), minutiae orientation (180) and the two 8-bin
-// offsets exist only to be argmax'd, so the argmax happens in the ONNX graph and
-// the host receives the winning bin. That is 286 coarse channels not transferred,
-// 4.4 MB per 512x512 image, and it is why RawImage is 1.15 MB instead of 5.8.
+// offsets are each read by exactly one operation, argmax over the channel axis, so
+// that argmax runs in the ONNX graph and the host receives the winning bin.
+// FingernetOnnx::transport() has the arithmetic for what that saves.
 struct RawImage {
     int h = 0, w = 0, H = 0, W = 0;
     int orig_h = 0, orig_w = 0;   // pre-pad dims (output cropping)
@@ -78,10 +78,6 @@ struct FnetProducts {
     std::shared_ptr<const std::vector<uint8_t>> enhanced_image_mod;  // [H*W], full only
     std::shared_ptr<const std::vector<fnpost::Minutia>> minutiae;
 };
-
-//: The name the chain carried before the model got its own output type. Same type,
-//: so a consumer naming Bundle keeps compiling; only the model edge had to change.
-using Bundle = FnetProducts;
 
 // A: segmentation -> cleaned (coarse) + segmentation_mask (u8). SOURCE node.
 struct MaskNode : arandu::ICpuScript<FnetRaw, FnetProducts> {
@@ -141,26 +137,28 @@ struct EnhancedNode : arandu::ICpuScript<FnetProducts, FnetProducts> {
     }
 };
 
-// E: minutiae. SINK node (returns the full Bundle).
+// Gating the score with the mask BEFORE the NMS is load-bearing, not a shortcut: the
+// NMS is order-dependent, so a background candidate that survives into it can suppress
+// a real foreground minutia. Masking afterwards is a different operation.
+inline std::vector<fnpost::Minutia> detect_minutiae(const RawImage& r,
+                                                    const std::vector<float>& cleaned) {
+    const int hw = r.h * r.w;
+    std::vector<float> masked(hw);
+    for (int k = 0; k < hw; ++k) masked[k] = r.minutiae_score[k] * cleaned[k];
+    return fnpost::detect_minutiae(masked.data(), r.minutiae_orientation_index.data(),
+                                   r.minutiae_x_index.data(), r.minutiae_y_index.data(),
+                                   r.h, r.w, r.threshold);
+}
+
+// E: minutiae. SINK node.
 struct MinutiaeNode : arandu::ICpuScript<FnetProducts, FnetProducts> {
     void run(std::span<const FnetProducts> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
             FnetProducts b = in[i];
             b.minutiae = std::make_shared<std::vector<fnpost::Minutia>>(
-                detect(*b.raw, *b.cleaned));
+                detect_minutiae(*b.raw, *b.cleaned));
             out[i] = std::move(b);
         }
-    }
-    // Gating the score with the mask BEFORE the NMS is load-bearing, not a shortcut:
-    // the NMS is order-dependent, so a background candidate that survives into it can
-    // suppress a real foreground minutia. Masking afterwards is a different operation.
-    static std::vector<fnpost::Minutia> detect(const RawImage& r, const std::vector<float>& cleaned) {
-        int hw = r.h * r.w;
-        std::vector<float> masked(hw);
-        for (int k = 0; k < hw; ++k) masked[k] = r.minutiae_score[k] * cleaned[k];
-        return fnpost::detect_minutiae(masked.data(), r.minutiae_orientation_index.data(),
-                                       r.minutiae_x_index.data(), r.minutiae_y_index.data(),
-                                       r.h, r.w, r.threshold);
     }
 };
 
@@ -181,7 +179,7 @@ struct PostprocNode : arandu::ICpuScript<FnetRaw, FnetProducts> {
             b.enhanced_image = std::make_shared<std::vector<uint8_t>>(fnpost::enhanced_u8(r.enhanced_real.data(), r.H, r.W));
             if (full) b.enhanced_image_mod = std::make_shared<std::vector<uint8_t>>(
                 fnpost::enhanced_masked_u8(r.enhanced_real.data(), cleaned->data(), r.h, r.w));
-            b.minutiae = std::make_shared<std::vector<fnpost::Minutia>>(MinutiaeNode::detect(r, *cleaned));
+            b.minutiae = std::make_shared<std::vector<fnpost::Minutia>>(detect_minutiae(r, *cleaned));
             b.cleaned = cleaned;
             out[i] = std::move(b);
         }

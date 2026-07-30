@@ -1,4 +1,4 @@
-// FingerNet ONNX as an arandu source node: InputImage -> Bundle(raw).
+// FingerNet ONNX as an arandu source node: InputImage -> FnetRaw.
 // The model has 1 input and 7 outputs (3 float maps + 4 argmax index planes), so it
 // can't use arandu's generic single-out OnnxModel<In,Out>; this is the
 // fingernet-specific model adapter (fingernet owns its model wiring, arandu builds
@@ -53,12 +53,7 @@ struct FnetOnnxConfig {
     // many callers the session has: 2 under the micro-batched actor, 1 when the phase
     // runs on its cpu fallback and every worker thread calls in.
     int intra_threads = 2;
-    // The graph's input name, needed to declare the TensorRT profile BEFORE the session
-    // exists (which is the only place the session could tell us). convert_to_onnx.py
-    // sets it; the constructor asserts the session agrees, so a rename fails loudly
-    // instead of silently dropping the profile and going back to 9.8 img/s.
-    std::string input_name = "input_image";
-    // Nominal (padded) input shape. Two jobs, both of which want the shape this run
+    // Nominal (padded) input shape, with two jobs that both want the shape this run
     // will actually see:
     //   * the transport declaration (see transport()) -- arandu::TransportSpec is a
     //     per-item promise the profiler reports and can assert, not a buffer size;
@@ -68,11 +63,17 @@ struct FnetOnnxConfig {
     //     That is not TensorRT being slow, it is TensorRT being asked a new question --
     //     it took this pipeline to 9.8 img/s against CUDA's 149. Declaring the profile
     //     as batch 1..max_batch at this shape builds ONE engine that covers every
-    //     micro-batch the executor can produce.
+    //     micro-batch the executor can produce, which is also why the constructor
+    //     refuses a graph whose input is not kInputName: the profile is keyed by that
+    //     name, and a silent mismatch is a silent return to 9.8 img/s.
     // Defaults to the SD258 padded shape; a driver that knows better should say so.
     int nominal_h = 768;
     int nominal_w = 800;
 };
+
+//: The input convert_to_onnx.py names. Not a per-run choice -- a term of the export
+//: contract, needed before a session exists to build the TensorRT profile string.
+inline constexpr const char* kInputName = "input_image";
 
 // Both ICpuScript (fallback / SerialExecutor) and IModel (PipelineExecutor's
 // micro-batched GPU phase via GraphBuilder::add_model).
@@ -107,7 +108,7 @@ public:
             }
             if (cfg_.nominal_h > 0 && cfg_.nominal_w > 0) {
                 auto shape = [&](int b) {
-                    return cfg_.input_name + ":" + std::to_string(b) + "x1x" +
+                    return std::string(kInputName) + ":" + std::to_string(b) + "x1x" +
                            std::to_string(cfg_.nominal_h) + "x" + std::to_string(cfg_.nominal_w);
                 };
                 m["trt_profile_min_shapes"] = shape(1);
@@ -121,9 +122,9 @@ public:
         session_ = std::make_unique<Ort::Session>(env_, cfg_.path.c_str(), so);
         Ort::AllocatorWithDefaultOptions a;
         in_name_ = session_->GetInputNameAllocated(0, a).get();
-        if (in_name_ != cfg_.input_name)
-            throw std::runtime_error("fingernet onnx: input is '" + in_name_ + "' but config says '" +
-                                     cfg_.input_name + "'; the TensorRT profile would be ignored");
+        if (in_name_ != kInputName)
+            throw std::runtime_error("fingernet onnx: input is '" + in_name_ + "', expected '" +
+                                     kInputName + "'; the TensorRT profile would be ignored");
         size_t no = session_->GetOutputCount();
         for (size_t i = 0; i < no; ++i) {
             std::string n = session_->GetOutputNameAllocated(i, a).get();
@@ -191,7 +192,7 @@ private:
             ARANDU_PROF(ctx, "gpu_run");   // ORT Run blocks until outputs ready => GPU+launch
             r = session_->Run(Ort::RunOptions{nullptr}, inn, &inp, 1, onn.data(), onn.size());
         }
-        ARANDU_PROF(ctx, "extract");       // host-side copy of the 7 outputs into Bundles
+        ARANDU_PROF(ctx, "extract");       // host-side copy of the 7 outputs, per image
 
         int h = in[b0].h, w = in[b0].w, hw = h * w;
         auto fp = [&](const char* name) { return r[out_idx_.at(name)].GetTensorData<float>(); };

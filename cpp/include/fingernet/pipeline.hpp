@@ -2,7 +2,8 @@
 // graph. Brings the whole arandu contract (graph, both executors, policy, loader,
 // profiler) plus every fingernet node that goes in it:
 //
-//   PathItem --load--> InputImage --onnx--> Bundle --postproc--> Bundle --serialize--> Written
+//   PathItem --load--> InputImage --onnx--> FnetRaw --postproc--> FnetProducts
+//            --serialize--> Written
 //
 // Needs the arandu headers on the include path, and libpng for the I/O nodes. The
 // ONNX node self-gates on FINGERNET_WITH_ONNX, so including this without ONNX

@@ -124,7 +124,7 @@ def postprocess(outputs: dict, threshold: float,
         minutiae_list = _post_detect_minutiae(outputs, threshold, cleaned_mask)
 
     with FnetTimer("Orientation Field Processing", logger, profile):
-        ori_idx = torch.argmax(outputs['orientation'], dim=1)
+        ori_idx = outputs['orientation_index']
         ori_idx_up = torch.nn.functional.interpolate(
             ori_idx.unsqueeze(1).float(), scale_factor=8, mode='nearest'
         ).squeeze(1)
@@ -199,17 +199,16 @@ def _post_binarize_mask_fast(seg_map: torch.Tensor) -> torch.Tensor:
 
     return cleaned_mask.squeeze(1)
 
-def _post_detect_minutiae_single(mnt_score, mnt_orient_batch_i, mnt_x_offset_batch_i,
-                                  mnt_y_offset_batch_i, threshold, device):
+def _post_detect_minutiae_single(mnt_score, ori_idx_i, x_idx_i, y_idx_i, threshold, device):
     """Detect and NMS minutiae for a single image."""
     rows, cols = torch.where(mnt_score > threshold)
     if rows.shape[0] == 0:
         return torch.empty((0, 4), device=device)
 
     scores = mnt_score[rows, cols]
-    angles_idx = torch.argmax(mnt_orient_batch_i[:, rows, cols], dim=0)
-    x_offsets = torch.argmax(mnt_x_offset_batch_i[:, rows, cols], dim=0)
-    y_offsets = torch.argmax(mnt_y_offset_batch_i[:, rows, cols], dim=0)
+    angles_idx = ori_idx_i[rows, cols]
+    x_offsets = x_idx_i[rows, cols]
+    y_offsets = y_idx_i[rows, cols]
 
     angles = (angles_idx * 2.0 - 89.0) * (torch.pi / 180.0)
     x_coords = cols * 8.0 + x_offsets
@@ -227,14 +226,13 @@ def _post_detect_minutiae(outputs: dict, threshold: float, cleaned_mask: torch.T
     foreground minutia. Masking afterwards is a different (worse) operation.
     """
     mnt_score_batch = outputs['minutiae_score'].squeeze(1) * cleaned_mask
-    mnt_orient_batch = outputs['minutiae_orientation']
-    mnt_x_offset_batch = outputs['minutiae_x_offset']
-    mnt_y_offset_batch = outputs['minutiae_y_offset']
+    ori_idx_batch = outputs['minutiae_orientation_index']
+    x_idx_batch = outputs['minutiae_x_index']
+    y_idx_batch = outputs['minutiae_y_index']
 
     return [
         _post_detect_minutiae_single(
-            mnt_score_batch[i], mnt_orient_batch[i],
-            mnt_x_offset_batch[i], mnt_y_offset_batch[i],
+            mnt_score_batch[i], ori_idx_batch[i], x_idx_batch[i], y_idx_batch[i],
             threshold, mnt_score_batch.device)
         for i in range(mnt_score_batch.shape[0])
     ]

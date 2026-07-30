@@ -164,6 +164,10 @@ int main(int argc, char** argv) {
     mc.device_id = a.device; mc.fp16 = a.fp16; mc.engine_cache = a.engine_cache;
     mc.threshold = a.threshold; mc.tf32 = a.tf32; mc.conv_algo = a.conv_algo;
     mc.nominal_h = nh; mc.nominal_w = nw;
+    // The intra-op pool is per session, so it is sized by how many callers the session
+    // will have -- one micro-batched actor per stream, or every cpu worker when the
+    // phase falls back (see the gpu_streams note below).
+    mc.intra_threads = a.streams > 0 ? 2 : 1;
     auto model = std::make_shared<FingernetOnnx>(mc);
     double t_sess = secs(tl, clk::now());
 

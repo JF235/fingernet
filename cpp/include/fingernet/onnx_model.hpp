@@ -46,6 +46,13 @@ struct FnetOnnxConfig {
     // autotune picks per-run algorithms whose reduction order differs. HEURISTIC is
     // the matching setting, and it also makes this tier reproducible run to run.
     std::string conv_algo = "HEURISTIC";  // HEURISTIC | EXHAUSTIVE | DEFAULT
+    // ORT's intra-op pool, which runs the nodes the CUDA EP leaves on the host: 15 of
+    // the 423, plus the 4 Memcpy that stitch the two sides. Worth 3.5% on CUDA (6.57 ->
+    // 6.34 ms/img) and saturating at 2; TensorRT is indifferent, having compiled the
+    // whole graph into 3 nodes. It is per SESSION, so the right value depends on how
+    // many callers the session has: 2 under the micro-batched actor, 1 when the phase
+    // runs on its cpu fallback and every worker thread calls in.
+    int intra_threads = 2;
     // The graph's input name, needed to declare the TensorRT profile BEFORE the session
     // exists (which is the only place the session could tell us). convert_to_onnx.py
     // sets it; the constructor asserts the session agrees, so a rename fails loudly
@@ -75,7 +82,7 @@ public:
     explicit FingernetOnnx(FnetOnnxConfig cfg)
         : cfg_(std::move(cfg)), env_(ORT_LOGGING_LEVEL_WARNING, "fingernet") {
         Ort::SessionOptions so;
-        so.SetIntraOpNumThreads(1);
+        so.SetIntraOpNumThreads(cfg_.intra_threads);
         so.SetInterOpNumThreads(1);
         so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         // V2 (string-keyed) provider options, not the legacy structs: use_tf32 has no

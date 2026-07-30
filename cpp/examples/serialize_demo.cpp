@@ -7,10 +7,9 @@
 #include <string>
 #include <vector>
 
-#include "fingernet/minfmt.hpp"
+#include "fingernet/fingernet.hpp"
 #include "fingernet/npy.hpp"
 #include "fingernet/png.hpp"
-#include "fingernet/postproc.hpp"
 
 static int meta_int(const std::string& d, const std::string& k, int def) {
     std::ifstream f(d + "/meta.txt"); std::string s;

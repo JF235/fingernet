@@ -14,12 +14,8 @@
 #include <string>
 #include <vector>
 
-#include "arandu/graph.hpp"
-#include "arandu/pipeline_executor.hpp"
-#include "arandu/serial_executor.hpp"
-#include "fingernet/arandu_nodes.hpp"
-#include "fingernet/minfmt.hpp"
-#include "fingernet/npy.hpp"
+#include "fingernet/npy.hpp"       // the Python reference dump; not part of the pipeline
+#include "fingernet/pipeline.hpp"
 
 using namespace fnaru;
 

@@ -13,9 +13,8 @@
 #include <string>
 #include <vector>
 
-#include "fingernet/minfmt.hpp"
+#include "fingernet/fingernet.hpp"
 #include "fingernet/npy.hpp"
-#include "fingernet/postproc.hpp"
 
 using fnpy::Array;
 

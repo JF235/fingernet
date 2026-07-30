@@ -10,11 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "arandu/graph.hpp"
-#include "arandu/pipeline_executor.hpp"
-#include "fingernet/arandu_nodes.hpp"
-#include "fingernet/io_nodes.hpp"
-#include "fingernet/onnx_model.hpp"
+#include "fingernet/pipeline.hpp"
 
 namespace fs = std::filesystem;
 using namespace fnaru;

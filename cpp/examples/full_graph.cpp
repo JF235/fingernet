@@ -11,7 +11,9 @@
 //                                which is what the retired StreamExecutor did
 //   --provider cuda|tensorrt|cpu, --fp16, --engine-cache DIR   model backend
 //   --no-tf32 --conv-algo HEURISTIC|EXHAUSTIVE  the two parity knobs (see onnx_model.hpp)
-//   --n N --batch B --threads T --actors A --depth D --warmup W   resources
+//   --n N --batch B --threads T --actors A --depth D --warmup W --streams S
+//                                resources; --streams 0 forces the model phase onto its
+//                                cpu fallback (one image per call), which is a mode, not a bug
 //   --threshold F --full         extraction parameters (--full adds the two _mod maps)
 //   --device ID --shard I/N      one process per GPU: same command, different I
 //   --out none                   skips disk, to isolate compute from I/O
@@ -42,7 +44,8 @@ namespace {
 
 struct Args {
     std::string onnx, images, out = "none", exec = "pipeline", provider = "cuda", engine_cache;
-    int n = 0, batch = 8, threads = 16, actors = 1, depth = 4, warmup = 8, device = 0;
+    int n = 0, batch = 8, threads = 16, actors = 2, depth = 4, warmup = 8, device = 0;
+    int streams = 2;   // >0 is what activates the MODEL phase; see resolve() in graph.hpp
     int shard = 0, shards = 1;
     float threshold = 0.05f;
     bool fp16 = false, full = false, tf32 = true;
@@ -75,6 +78,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--depth") a.depth = std::atoi(val().c_str());
         else if (k == "--warmup") a.warmup = std::atoi(val().c_str());
         else if (k == "--device") a.device = std::atoi(val().c_str());
+        else if (k == "--streams") a.streams = std::atoi(val().c_str());
         else if (k == "--threshold") a.threshold = std::atof(val().c_str());
         else if (k == "--fp16") a.fp16 = true;
         else if (k == "--no-tf32") a.tf32 = false;
@@ -138,9 +142,9 @@ int main(int argc, char** argv) {
     std::vector<std::any> input(items.begin(), items.end());
 
     printf("graph: %zu imgs (shard %d/%d), exec=%s, provider=%s%s, T=%d, B=%d, actors=%d, "
-           "depth=%d, warmup=%d, thr=%.3f, tf32=%d, algo=%s%s\n",
+           "depth=%d, streams=%d, warmup=%d, thr=%.3f, tf32=%d, algo=%s%s\n",
            items.size(), a.shard, a.shards, a.exec.c_str(), a.provider.c_str(),
-           a.fp16 ? "+fp16" : "", a.threads, a.batch, a.actors, a.depth, a.warmup,
+           a.fp16 ? "+fp16" : "", a.threads, a.batch, a.actors, a.depth, a.streams, a.warmup,
            a.threshold, (int)a.tf32, a.conv_algo.c_str(), a.full ? ", full" : "");
 
     // The padded shape of the first image: the model needs it before the session
@@ -189,8 +193,27 @@ int main(int argc, char** argv) {
     pol.cpu_threads = a.threads;
     pol.max_batch = a.batch;
     pol.channel_depth = a.depth;
+    // gpu_streams is one of the four conditions arandu::resolve() requires before it
+    // picks a phase's IModel over its ICpuScript, and it defaults to 0 -- so a driver
+    // that forgets it declares a model phase and silently gets the fallback: not one
+    // batched actor, but cpu_threads workers each calling the session with a batch of
+    // ONE, with --batch and --actors inert. Nothing complains, because the ONNX
+    // session is CUDA either way and the GPU stays busy; it just runs 7% slower
+    // (148.4 vs 158.6 img/s, BN48k 1k). Hence the default, and hence the line printed
+    // below: which impl each phase resolved to is not something to infer from a
+    // throughput number.
+    pol.gpu_streams = a.streams;
     pol.model_actors = a.actors;
     pol.profiler = (a.exec == "pipeline") ? &prof : nullptr;
+
+    printf("phases:");
+    for (const auto& p : g.phases) {
+        arandu::PhaseImpl impl = arandu::resolve(p, pol);
+        const char* k = impl == arandu::PhaseImpl::Model ? "MODEL"
+                      : impl == arandu::PhaseImpl::Join  ? "join" : "cpu";
+        printf("  %s=%s", p.name.c_str(), k);
+    }
+    printf("\n");
 
     auto t0 = clk::now();
     std::vector<std::any> res;

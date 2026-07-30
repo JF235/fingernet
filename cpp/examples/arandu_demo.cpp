@@ -69,8 +69,7 @@ int main(int argc, char** argv) {
         r->minutiae_orientation_index = amax("minutiae_orientation", 180);
         r->minutiae_x_index = amax("minutiae_x_offset", 8);
         r->minutiae_y_index = amax("minutiae_y_offset", 8);
-        Bundle b; b.raw = r;
-        input.emplace_back(std::move(b));
+        input.emplace_back(FnetRaw{std::move(r)});
     }
 
     arandu::Graph g = build_postproc_graph();
@@ -128,5 +127,45 @@ int main(int argc, char** argv) {
     }
     printf("[vs Python] minutiae exact=%ld/%ld (%.4f%%)  quality px mism=%ld  enhanced px mism=%ld  mask px mism=%ld\n",
            e_ok, e_ref, e_ref ? 100.0 * e_ok / e_ref : 100.0, q_mism, en_mism, mk_mism);
-    return 0;
+
+    // (3) The FUSED node vs the CHAIN. PostprocNode is a hand transcription of the five
+    // node bodies, production runs the fused one, and every gate above exercises only
+    // the chain -- so the code that actually ships had nothing checking it.
+    arandu::GraphBuilder fb;
+    fb.add<FnetRaw, FnetProducts>("postproc", std::make_shared<PostprocNode>(), {});
+    auto rf = arandu::SerialExecutor{}.run(fb.build(), input);
+    long fdiff = 0;
+    for (int i = 0; i < N; ++i) {
+        const FnetProducts& c = std::any_cast<const FnetProducts&>(rs[i]);
+        const FnetProducts& f = std::any_cast<const FnetProducts&>(rf[i]);
+        bool same = *c.segmentation_mask == *f.segmentation_mask && *c.quality == *f.quality &&
+                    *c.orientation_field == *f.orientation_field &&
+                    *c.enhanced_image == *f.enhanced_image &&
+                    c.minutiae->size() == f.minutiae->size();
+        for (size_t k = 0; same && k < c.minutiae->size(); ++k) {
+            const auto& m1 = (*c.minutiae)[k]; const auto& m2 = (*f.minutiae)[k];
+            same = m1.x == m2.x && m1.y == m2.y && m1.angle == m2.angle && m1.score == m2.score;
+        }
+        if (!same) ++fdiff;
+    }
+    printf("[fused vs chain] differing images: %ld/%d  -> %s\n", fdiff, N,
+           fdiff == 0 ? "BYTE-IDENTICAL" : "MISMATCH");
+
+    // (4) The edge types must REJECT the mis-wire they exist to prevent: `enhanced`
+    // reads `cleaned`, which only the entry nodes fill, so hanging it off a FnetRaw
+    // producer has to fail in build() rather than at the first null deref.
+    bool rejected = false;
+    try {
+        arandu::GraphBuilder bad;
+        bad.add<FnetRaw, FnetProducts>("entry", std::make_shared<MaskNode>(), {});
+        // `entry` emits FnetProducts; a second entry-point node wants FnetRaw.
+        bad.add<FnetRaw, FnetProducts>("second", std::make_shared<PostprocNode>(), {"entry"});
+        bad.build();
+    } catch (const std::exception& e) {
+        rejected = true;
+        printf("[mis-wire] build() rejected it: %s\n", e.what());
+    }
+    if (!rejected) printf("[mis-wire] NOT REJECTED -- the edge types are not doing their job\n");
+
+    return (fdiff == 0 && rejected) ? 0 : 1;
 }

@@ -44,12 +44,31 @@ struct InputImage {
     std::vector<float> data;          // [H*W]
 };
 
+// What the model emits, and the ONLY type the postproc entry points accept.
+//
+// It exists to put an ordering constraint back into the type system. The products
+// carrier below is an accumulator (arandu/kernel.hpp calls this pattern (B) and
+// advises against it): every postproc node has the same in and out type, so wiring
+// `enhanced` straight off the model type-checks at build() and then dereferences a
+// null `cleaned` at run time, on some input, in production. Giving the model its own
+// output type closes that, because the only two nodes that accept a FnetRaw are the
+// two that fill `cleaned` -- MaskNode and PostprocNode. Anything else wired to the
+// model now fails in build() with "type mismatch on edge".
+//
+// One flat field, deliberately: a per-stage type for every field would put the
+// guarantee on the wrong node (the second node in the chain is QualityNode, which
+// does not read `cleaned`) while pushing a `.masked.in.` prefix through every access
+// path in three repositories. The guarantee lives entirely at the chain's entrance.
+struct FnetRaw {
+    std::shared_ptr<const RawImage> raw;
+};
+
 // Carrier threaded through the postproc chain; shared_ptr => cheap to copy.
 // The five primitives are what wrapper.py returns; enhanced_image_mod is the one
 // derived product that is NOT the mask times a primitive (normalising the masked
 // float puts the background at mid-grey, masking the quantised u8 puts it at
 // black), so it is computed here or not at all -- see the `full` flag.
-struct Bundle {
+struct FnetProducts {
     std::shared_ptr<const RawImage> raw;
     std::shared_ptr<const std::vector<float>> cleaned;               // coarse {0,1}
     std::shared_ptr<const std::vector<uint8_t>> segmentation_mask;   // [H*W]
@@ -60,11 +79,15 @@ struct Bundle {
     std::shared_ptr<const std::vector<fnpost::Minutia>> minutiae;
 };
 
+//: The name the chain carried before the model got its own output type. Same type,
+//: so a consumer naming Bundle keeps compiling; only the model edge had to change.
+using Bundle = FnetProducts;
+
 // A: segmentation -> cleaned (coarse) + segmentation_mask (u8). SOURCE node.
-struct MaskNode : arandu::ICpuScript<Bundle, Bundle> {
-    void run(std::span<const Bundle> in, std::span<Bundle> out, arandu::RunCtx&) const override {
+struct MaskNode : arandu::ICpuScript<FnetRaw, FnetProducts> {
+    void run(std::span<const FnetRaw> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            Bundle b = in[i];
+            FnetProducts b; b.raw = in[i].raw;
             const RawImage& r = *b.raw;
             auto cleaned = std::make_shared<std::vector<float>>(
                 fnpost::binarize_mask_fast(r.segmentation.data(), r.h, r.w));
@@ -77,10 +100,10 @@ struct MaskNode : arandu::ICpuScript<Bundle, Bundle> {
 };
 
 // B: segmentation -> quality (u8).
-struct QualityNode : arandu::ICpuScript<Bundle, Bundle> {
-    void run(std::span<const Bundle> in, std::span<Bundle> out, arandu::RunCtx&) const override {
+struct QualityNode : arandu::ICpuScript<FnetProducts, FnetProducts> {
+    void run(std::span<const FnetProducts> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            Bundle b = in[i];
+            FnetProducts b = in[i];
             const RawImage& r = *b.raw;
             b.quality = std::make_shared<std::vector<uint8_t>>(
                 fnpost::quality_u8(r.segmentation.data(), r.h, r.w));
@@ -90,10 +113,10 @@ struct QualityNode : arandu::ICpuScript<Bundle, Bundle> {
 };
 
 // C: orientation_index -> orientation_field (rad).
-struct OriNode : arandu::ICpuScript<Bundle, Bundle> {
-    void run(std::span<const Bundle> in, std::span<Bundle> out, arandu::RunCtx&) const override {
+struct OriNode : arandu::ICpuScript<FnetProducts, FnetProducts> {
+    void run(std::span<const FnetProducts> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            Bundle b = in[i];
+            FnetProducts b = in[i];
             const RawImage& r = *b.raw;
             b.orientation_field = std::make_shared<std::vector<float>>(
                 fnpost::orientation_field(r.orientation_index.data(), r.h, r.w));
@@ -103,11 +126,11 @@ struct OriNode : arandu::ICpuScript<Bundle, Bundle> {
 };
 
 // D (+ the mod variant under `full`): enhanced_real -> enhanced_image. Needs cleaned.
-struct EnhancedNode : arandu::ICpuScript<Bundle, Bundle> {
+struct EnhancedNode : arandu::ICpuScript<FnetProducts, FnetProducts> {
     bool full = false;
-    void run(std::span<const Bundle> in, std::span<Bundle> out, arandu::RunCtx&) const override {
+    void run(std::span<const FnetProducts> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            Bundle b = in[i];
+            FnetProducts b = in[i];
             const RawImage& r = *b.raw;
             b.enhanced_image = std::make_shared<std::vector<uint8_t>>(
                 fnpost::enhanced_u8(r.enhanced_real.data(), r.H, r.W));
@@ -119,10 +142,10 @@ struct EnhancedNode : arandu::ICpuScript<Bundle, Bundle> {
 };
 
 // E: minutiae. SINK node (returns the full Bundle).
-struct MinutiaeNode : arandu::ICpuScript<Bundle, Bundle> {
-    void run(std::span<const Bundle> in, std::span<Bundle> out, arandu::RunCtx&) const override {
+struct MinutiaeNode : arandu::ICpuScript<FnetProducts, FnetProducts> {
+    void run(std::span<const FnetProducts> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            Bundle b = in[i];
+            FnetProducts b = in[i];
             b.minutiae = std::make_shared<std::vector<fnpost::Minutia>>(
                 detect(*b.raw, *b.cleaned));
             out[i] = std::move(b);
@@ -143,11 +166,11 @@ struct MinutiaeNode : arandu::ICpuScript<Bundle, Bundle> {
 
 // All postproc blocks fused into ONE node (best for the pipeline: fewer phases
 // => fewer channels/threads + better cache locality). Same math as the chain.
-struct PostprocNode : arandu::ICpuScript<Bundle, Bundle> {
+struct PostprocNode : arandu::ICpuScript<FnetRaw, FnetProducts> {
     bool full = false;
-    void run(std::span<const Bundle> in, std::span<Bundle> out, arandu::RunCtx&) const override {
+    void run(std::span<const FnetRaw> in, std::span<FnetProducts> out, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            Bundle b = in[i];
+            FnetProducts b; b.raw = in[i].raw;
             const RawImage& r = *b.raw;
             auto cleaned = std::make_shared<std::vector<float>>(
                 fnpost::binarize_mask_fast(r.segmentation.data(), r.h, r.w));
@@ -169,11 +192,11 @@ struct PostprocNode : arandu::ICpuScript<Bundle, Bundle> {
 inline arandu::Graph build_postproc_graph(bool full = false) {
     auto enh = std::make_shared<EnhancedNode>(); enh->full = full;
     arandu::GraphBuilder gb;
-    gb.add<Bundle, Bundle>("mask", std::make_shared<MaskNode>(), {});
-    gb.add<Bundle, Bundle>("quality", std::make_shared<QualityNode>(), {"mask"});
-    gb.add<Bundle, Bundle>("ori", std::make_shared<OriNode>(), {"quality"});
-    gb.add<Bundle, Bundle>("enhanced", enh, {"ori"});
-    gb.add<Bundle, Bundle>("minutiae", std::make_shared<MinutiaeNode>(), {"enhanced"});
+    gb.add<FnetRaw, FnetProducts>("mask", std::make_shared<MaskNode>(), {});
+    gb.add<FnetProducts, FnetProducts>("quality", std::make_shared<QualityNode>(), {"mask"});
+    gb.add<FnetProducts, FnetProducts>("ori", std::make_shared<OriNode>(), {"quality"});
+    gb.add<FnetProducts, FnetProducts>("enhanced", enh, {"ori"});
+    gb.add<FnetProducts, FnetProducts>("minutiae", std::make_shared<MinutiaeNode>(), {"enhanced"});
     return gb.build();
 }
 

@@ -168,9 +168,9 @@ int main(int argc, char** argv) {
     auto post = std::make_shared<PostprocNode>(); post->full = a.full;
     arandu::GraphBuilder gb;
     gb.add<PathItem, InputImage>("load", std::make_shared<LoadNode>(), {});
-    gb.add_model<InputImage, Bundle>("onnx", model, model, {"load"});
-    gb.add<Bundle, Bundle>("postproc", post, {"onnx"});
-    gb.add<Bundle, Written>("serialize", std::make_shared<SerializeNode>(a.out, a.full), {"postproc"});
+    gb.add_model<InputImage, FnetRaw>("onnx", model, model, {"load"});
+    gb.add<FnetRaw, FnetProducts>("postproc", post, {"onnx"});
+    gb.add<FnetProducts, Written>("serialize", std::make_shared<SerializeNode>(a.out), {"postproc"});
     arandu::Graph g = gb.build();
 
     // Warmup on the first image, repeated: pays the CUDA/cuDNN/arena cost (and, for
@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
         std::vector<PathItem> wp(std::min<size_t>(a.warmup, items.size()), items[0]);
         std::vector<InputImage> wi(wp.size());
         arandu::RunCtx wc; LoadNode{}.run(wp, wi, wc);
-        std::vector<Bundle> wb(wi.size());
+        std::vector<FnetRaw> wb(wi.size());
         model->infer(wi, wb, wc);
     }
     double t_warm = secs(tl, clk::now()) - t_sess;

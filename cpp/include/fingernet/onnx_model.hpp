@@ -76,8 +76,8 @@ struct FnetOnnxConfig {
 
 // Both ICpuScript (fallback / SerialExecutor) and IModel (PipelineExecutor's
 // micro-batched GPU phase via GraphBuilder::add_model).
-class FingernetOnnx : public arandu::ICpuScript<InputImage, Bundle>,
-                      public arandu::IModel<InputImage, Bundle> {
+class FingernetOnnx : public arandu::ICpuScript<InputImage, FnetRaw>,
+                      public arandu::IModel<InputImage, FnetRaw> {
 public:
     explicit FingernetOnnx(FnetOnnxConfig cfg)
         : cfg_(std::move(cfg)), env_(ORT_LOGGING_LEVEL_WARNING, "fingernet") {
@@ -132,11 +132,11 @@ public:
         }
     }
 
-    void run(std::span<const InputImage> in, std::span<Bundle> out, arandu::RunCtx& ctx) const override {
+    void run(std::span<const InputImage> in, std::span<FnetRaw> out, arandu::RunCtx& ctx) const override {
         forward(in, out, ctx);
     }
     // IModel (used by PipelineExecutor's micro-batched MODEL phase)
-    void infer(std::span<const InputImage> in, std::span<Bundle> out, arandu::RunCtx& ctx) const override {
+    void infer(std::span<const InputImage> in, std::span<FnetRaw> out, arandu::RunCtx& ctx) const override {
         forward(in, out, ctx);
     }
     int max_batch() const override { return cfg_.max_batch; }
@@ -167,13 +167,13 @@ public:
     }
 
 private:
-    void forward(std::span<const InputImage> in, std::span<Bundle> out, arandu::RunCtx& ctx) const {
+    void forward(std::span<const InputImage> in, std::span<FnetRaw> out, arandu::RunCtx& ctx) const {
         const int N = static_cast<int>(in.size());
         for (int b0 = 0; b0 < N; b0 += cfg_.max_batch)
             forward_chunk(in, out, b0, std::min(b0 + cfg_.max_batch, N), ctx);
     }
 
-    void forward_chunk(std::span<const InputImage> in, std::span<Bundle> out, int b0, int b1,
+    void forward_chunk(std::span<const InputImage> in, std::span<FnetRaw> out, int b0, int b1,
                        arandu::RunCtx& ctx) const {
         int B = b1 - b0;
         int H = in[b0].H, W = in[b0].W, HW = H * W;
@@ -217,8 +217,7 @@ private:
             ri->minutiae_orientation_index = cp(p_mi, hw);
             ri->minutiae_x_index = cp(p_xi, hw);
             ri->minutiae_y_index = cp(p_yi, hw);
-            Bundle bd; bd.raw = ri;
-            out[b0 + k] = std::move(bd);
+            out[b0 + k] = FnetRaw{std::move(ri)};
         }
     }
 

@@ -39,12 +39,17 @@ struct LoadNode : arandu::ICpuScript<PathItem, InputImage> {
 
 // serialize(sink): crop maps to orig, write the artifacts api.py writes -- the five
 // defaults (minutiae/ enhanced/ mask/ ori/ quality/), plus enhanced_mod/ and ori_mod/
-// when `full`. Same set, same names, same directory layout, so the two extractions
+// when the producer made them. Same set, same names, same directory layout, so the two extractions
 // diff directly.
-struct SerializeNode : arandu::ICpuScript<Bundle, Written> {
+// Whether the _mod pair is written is read off the DATA, not off a second flag.
+// There used to be two independent `full` booleans -- this node's and the producer's
+// (PostprocNode/EnhancedNode) -- and disagreeing them dereferenced a null
+// enhanced_image_mod: exactly the build()-passes-runtime-fails failure the edge types
+// were introduced to remove, reintroduced through a constructor argument. The producer
+// now decides alone, and this node writes what it was given.
+struct SerializeNode : arandu::ICpuScript<FnetProducts, Written> {
     std::string out;
-    bool full = false;
-    explicit SerializeNode(std::string o, bool f = false) : out(std::move(o)), full(f) {}
+    explicit SerializeNode(std::string o) : out(std::move(o)) {}
     static std::vector<uint8_t> crop(const std::vector<uint8_t>& s, int W, int oh, int ow) {
         std::vector<uint8_t> d(static_cast<size_t>(oh) * ow);
         for (int y = 0; y < oh; ++y)
@@ -66,9 +71,9 @@ struct SerializeNode : arandu::ICpuScript<Bundle, Written> {
         fs::create_directories(p.parent_path());
         fnmin::write_min(p.string(), fnmin::to_min_rows(m));
     }
-    void run(std::span<const Bundle> in, std::span<Written> outv, arandu::RunCtx&) const override {
+    void run(std::span<const FnetProducts> in, std::span<Written> outv, arandu::RunCtx&) const override {
         for (size_t i = 0; i < in.size(); ++i) {
-            const Bundle& b = in[i]; const RawImage& r = *b.raw;
+            const FnetProducts& b = in[i]; const RawImage& r = *b.raw;
             if (out == "none") { outv[i] = Written{r.id, (int)b.minutiae->size()}; continue; }  // I/O-isolation
             int oh = r.orig_h, ow = r.orig_w, W = r.W;
             const auto& of = *b.orientation_field;
@@ -80,7 +85,7 @@ struct SerializeNode : arandu::ICpuScript<Bundle, Written> {
             save("quality", r.id, *b.quality, W, oh, ow);
             save("ori", r.id, orip, W, oh, ow);
             save_min("minutiae", r.id, *b.minutiae);
-            if (full) {
+            if (b.enhanced_image_mod) {
                 // ori_mod is the mask times a primitive, so it is derived here rather
                 // than carried; enhanced_mod is not (see enhanced_masked_u8).
                 auto cup = fnpost::nearest_up(b.cleaned->data(), r.h, r.w);

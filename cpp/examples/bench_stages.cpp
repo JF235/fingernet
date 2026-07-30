@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
     // ---- Stage 1: MODEL (single stream, batched) --------------------------
     FnetOnnxConfig mc; mc.path = onnx; mc.provider = provider; mc.max_batch = 8;
     FingernetOnnx model(mc);
-    std::vector<Bundle> raw(N);
+    std::vector<FnetRaw> raw(N);
     model.run(imgsv, raw, ctx);                              // warmup (build engine / cudnn autotune)
     auto t0 = clk::now();
     model.run(imgsv, raw, ctx);
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
 
     // ---- Stage 3: I/O (parallel across items, PNG+.min to disk) -----------
     arandu::GraphBuilder gb;
-    gb.add<Bundle, Written>("serialize", std::make_shared<SerializeNode>(out), {});
+    gb.add<FnetProducts, Written>("serialize", std::make_shared<SerializeNode>(out), {});
     arandu::Graph gio = gb.build();
     t0 = clk::now();
     auto io_any = se.run(gio, post_any);

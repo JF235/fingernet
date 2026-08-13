@@ -15,6 +15,7 @@
 #include "arandu/arandu.hpp"
 
 #include "arandu_nodes.hpp"
+#include "fan_nodes.hpp"
 #include "fingernet.hpp"
 #include "io_nodes.hpp"
 #include "onnx_model.hpp"

@@ -47,7 +47,10 @@ if(FINGERNET_WITH_ONNX)
     message(FATAL_ERROR "FINGERNET_WITH_ONNX needs -DORT_LIBFILE=<lib> -DORT_INCLUDE=<inc>")
   endif()
   if(EXISTS "${ARANDU_ROOT}/include/arandu/graph.hpp" AND PNG_FOUND)
-    foreach(tgt full_graph bench_stages)
+    # graph_run is full_graph with the wiring moved out of C++ and into a spec file:
+    # the same nodes, assembled through arandu::NodeRegistry, so a graph drawn in a UI
+    # is a graph this can run.
+    foreach(tgt full_graph bench_stages graph_run)
       add_executable(${tgt} examples/${tgt}.cpp)
       target_include_directories(${tgt} PRIVATE ${ARANDU_ROOT}/include ${ORT_INCLUDE})
       target_link_libraries(${tgt} PRIVATE fingernet_postproc PNG::PNG ${ORT_LIBFILE} Threads::Threads)

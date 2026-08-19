@@ -21,16 +21,33 @@
 // A run is therefore ONE artifact: the graph, its parameters and the policy in a single
 // file that can be kept, diffed and replayed. Usage:
 //
-//   graph_run <spec-file> [--profile]
+//   graph_run <spec-file> [--profile]     one run, then exit
+//   graph_run --serve [--profile]         stay up: one spec path per line on stdin
 //
 // Prints a JSON summary on stdout (the server reads it) and, with --profile, the
 // profiler's markdown on stderr.
+//
+// WHY --serve EXISTS. One run cost ~3.3 s before it computed anything, and on the 20-image
+// runs a UI actually issues that was most of the wall. Measured on 512x512 SD4 images,
+// GPU 3, writing all five products:
+//
+//   images |  8   |  32  | 128  | 512
+//   wall   | 1.62 | 2.28 | 3.15 | 6.38    -> 8.4 ms/image, plus a 2.07 s intercept
+//
+// and another ~1.3 s outside that wall (process start, ORT's dlopen of the CUDA provider,
+// session construction). The intercept is cuDNN picking algorithms and allocating its
+// workspace on the first forwards: nothing about it is per-image, and a process that exits
+// throws it away, so the NEXT run pays it again. --serve keeps the process, and with it the
+// CUDA context, the ONNX session and cuDNN's warm state; the caller writes a spec and sends
+// its path. Same specs, same JSON, same code doing the run -- the difference is only who
+// pays for the warm-up, and how often.
 #include <algorithm>
 #include <any>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <sstream>
 #include <string>
@@ -102,9 +119,11 @@ struct Spec {
     }
 };
 
+/// Throws rather than dies: in --serve a bad spec must cost the request, not the process
+/// (and the warm session inside it).
 Spec read_spec(const std::string& path) {
     std::ifstream f(path);
-    if (!f) die("cannot read spec " + path);
+    if (!f) throw std::runtime_error("cannot read spec " + path);
     Spec spec;
     int lineno = 0;
     for (std::string raw; std::getline(f, raw);) {
@@ -114,15 +133,17 @@ Spec read_spec(const std::string& path) {
 
         if (line[0] == '@') {
             const size_t sep = line.find_first_of(" \t");
-            if (sep == std::string::npos) die("line " + std::to_string(lineno) +
-                                             ": @setting needs a value");
+            if (sep == std::string::npos)
+                throw std::runtime_error("line " + std::to_string(lineno) +
+                                         ": @setting needs a value");
             spec.run[line.substr(1, sep - 1)] = trim(line.substr(sep + 1));
             continue;
         }
 
         const auto cols = split(line, '\t');
         if (cols.size() < 2)
-            die("line " + std::to_string(lineno) + ": need at least name<TAB>type");
+            throw std::runtime_error("line " + std::to_string(lineno) +
+                                     ": need at least name<TAB>type");
         arandu::NodeConfig c;
         c.name = trim(cols[0]);
         c.type = trim(cols[1]);
@@ -131,13 +152,14 @@ Spec read_spec(const std::string& path) {
             for (const auto& kv : split(trim(cols[3]), ';')) {
                 const size_t eq = kv.find('=');
                 if (eq == std::string::npos)
-                    die("line " + std::to_string(lineno) + ": param '" + kv + "' is not k=v");
+                    throw std::runtime_error("line " + std::to_string(lineno) + ": param '" +
+                                             kv + "' is not k=v");
                 c.params[trim(kv.substr(0, eq))] = trim(kv.substr(eq + 1));
             }
         }
         spec.nodes.push_back(std::move(c));
     }
-    if (spec.nodes.empty()) die("spec declares no nodes");
+    if (spec.nodes.empty()) throw std::runtime_error("spec declares no nodes");
     return spec;
 }
 
@@ -163,6 +185,11 @@ ProbeShape probe_shape;
 /// `build()` -- before a policy exists -- and the ONNX session is created in the model's
 /// constructor. Same idiom as `probe_shape` above, for the same reason.
 int run_gpu = 0;
+
+/// How many actors the policy will give the model phase, parked here for the same reason
+/// and by the same route as `run_gpu`: it sizes the threads the ONNX session creates in its
+/// constructor (see FingernetOnnx's runner), and a constructor runs inside build().
+int run_actors = 2;
 
 bool truthy(const std::string& v) { return v == "1" || v == "true" || v == "on"; }
 
@@ -196,6 +223,7 @@ void register_types() {
         mc.tf32 = truthy(c.get("tf32", "1"));
         mc.conv_algo = c.get("conv_algo", "HEURISTIC");
         mc.intra_threads = c.get_int("intra_threads", 2);
+        mc.ort_threads = run_actors;     // policy, like the GPU (see run_actors)
         // The spec may pin the shape; otherwise the probe knows it, which is the case
         // that matters -- a wrong nominal shape is a TensorRT engine rebuild per batch.
         // 0 means "probe", not 0x0: a writer that emits every field explicitly (the GUI
@@ -236,7 +264,10 @@ void register_types() {
     });
     R.reg("serialize", [](arandu::GraphBuilder& gb, const arandu::NodeConfig& c) {
         need_inputs(c, 6);
-        gb.addN(c.name, std::make_shared<fan::Serialize>(c.get("out", "none")), c.inputs);
+        gb.addN(c.name,
+                std::make_shared<fan::Serialize>(
+                    c.get("out", "none"), c.get_int("png_level", fnpng::kDefaultLevel)),
+                c.inputs);
     });
 
     // The fused postproc and its 1-input sink: same math, one phase instead of six.
@@ -249,8 +280,11 @@ void register_types() {
         gb.add<FnetRaw, FnetProducts>(c.name, n, c.inputs);
     });
     R.reg("serialize_fused", [](arandu::GraphBuilder& gb, const arandu::NodeConfig& c) {
-        gb.add<FnetProducts, Written>(c.name, std::make_shared<SerializeNode>(c.get("out", "none")),
-                                      c.inputs);
+        gb.add<FnetProducts, Written>(
+            c.name,
+            std::make_shared<SerializeNode>(
+                c.get("out", "none"), c.get_int("png_level", fnpng::kDefaultLevel)),
+            c.inputs);
     });
 }
 
@@ -258,13 +292,13 @@ std::vector<PathItem> collect(const std::string& images) {
     std::vector<PathItem> items;
     if (images.size() > 4 && images.compare(images.size() - 4, 4, ".txt") == 0) {
         std::ifstream f(images);
-        if (!f) die("cannot read list " + images);
+        if (!f) throw std::runtime_error("cannot read list " + images);
         for (std::string line; std::getline(f, line);) {
             line = trim(line);
             if (!line.empty()) items.push_back({line, fs::path(line).stem().string()});
         }
     } else {
-        if (!fs::exists(images)) die("no such path: " + images);
+        if (!fs::exists(images)) throw std::runtime_error("no such path: " + images);
         if (fs::is_regular_file(images)) {
             items.push_back({images, fs::path(images).stem().string()});
             return items;
@@ -295,19 +329,42 @@ SinkCount count_one(const std::any& v) {
     return {};
 }
 
-}  // namespace
+/// The graph kept between --serve requests, with the key that says whether it still
+/// answers the question being asked.
+///
+/// ONE entry, not an LRU. What is worth keeping warm is "the same graph again" -- a user
+/// pressing Run after looking at the last result -- and every entry holds an ONNX session,
+/// i.e. GPU memory on a shared machine. A second slot would double that to serve a case
+/// that does not happen. The key is everything the CONSTRUCTION depends on: the node lines
+/// verbatim (so a changed param rebuilds), the GPU, and the probed padded shape (which
+/// feeds the TensorRT profile and the transport declaration).
+struct Warm {
+    std::string key;          // empty = nothing cached; never empty for a built graph
+    arandu::Graph g;
+    void drop() { g = arandu::Graph{}; key.clear(); }
+};
 
-int main(int argc, char** argv) {
-    if (argc < 2) die("usage: graph_run <spec-file> [--profile]");
-    const bool want_profile = argc > 2 && std::string(argv[2]) == "--profile";
-    const Spec spec = read_spec(argv[1]);
+std::string graph_key(const Spec& spec, int gpu, int actors, ProbeShape ps) {
+    std::string k = "gpu=" + std::to_string(gpu) + ";actors=" + std::to_string(actors) +
+                    ";shape=" + std::to_string(ps.h) + "x" + std::to_string(ps.w);
+    for (const auto& c : spec.nodes) {
+        k += "\n" + c.name + "\t" + c.type + "\t";
+        for (const auto& i : c.inputs) k += i + ",";
+        k += "\t";
+        for (const auto& [a, b] : c.params) k += a + "=" + b + ";";   // std::map => ordered
+    }
+    return k;
+}
 
+/// One run. Prints exactly one JSON line on stdout whatever happens, and returns the
+/// process exit code the one-shot mode uses (0 ok, 3 invalid graph, 4 run failed).
+int run_once(const Spec& spec, bool want_profile, Warm& warm) {
     const std::string images = spec.get("images");
-    if (images.empty()) die("spec needs an @images line");
+    if (images.empty()) throw std::runtime_error("spec needs an @images line");
     std::vector<PathItem> items = collect(images);
     const int limit = spec.get_int("n", 0);
     if (limit > 0 && static_cast<int>(items.size()) > limit) items.resize(limit);
-    if (items.empty()) die("no images under " + images);
+    if (items.empty()) throw std::runtime_error("no images under " + images);
 
     // The padded shape, before any session exists (see ProbeShape).
     {
@@ -317,22 +374,34 @@ int main(int argc, char** argv) {
         probe_shape = {probe.H, probe.W};
     }
 
-    // BEFORE build(): the model node's factory reads `run_gpu` to construct the session.
+    // BEFORE build(): the model node's factory reads `run_gpu` and `run_actors` to build
+    // the session and the threads that own it.
     run_gpu = spec.get_int("gpu", 0);
+    run_actors = spec.get_int("actors", 2);
 
-    register_types();
+    const std::string key = graph_key(spec, run_gpu, run_actors, probe_shape);
+    const bool reuse = !warm.key.empty() && warm.key == key;
     const auto t0 = clk::now();
-    arandu::Graph g;
-    try {
-        g = arandu::NodeRegistry::instance().build(spec.nodes);
-    } catch (const std::exception& exc) {
-        // The graph the user drew is invalid, and arandu said exactly why (unknown type,
-        // type mismatch on edge, cycle, missing sink). Passing that through verbatim is
-        // the whole point of letting build() be the validator.
-        std::fprintf(stderr, "graph_run: invalid graph: %s\n", exc.what());
-        std::printf("{\"ok\":false,\"error\":\"%s\"}\n", esc(exc.what()).c_str());
-        return 3;
+    if (!reuse) {
+        // Freed BEFORE the new one is built: two fingernet sessions on the same GPU is
+        // twice the workspace for one run's worth of work, and on a shared box that is
+        // the difference between a rebuild and an OOM.
+        warm.drop();
+        try {
+            warm.g = arandu::NodeRegistry::instance().build(spec.nodes);
+        } catch (const std::exception& exc) {
+            // The graph the user drew is invalid, and arandu said exactly why (unknown type,
+            // type mismatch on edge, cycle, missing sink). Passing that through verbatim is
+            // the whole point of letting build() be the validator.
+            std::fprintf(stderr, "graph_run: invalid graph: %s\n", exc.what());
+            std::fflush(stderr);
+            std::printf("{\"ok\":false,\"error\":\"%s\"}\n", esc(exc.what()).c_str());
+            std::fflush(stdout);
+            return 3;
+        }
+        warm.key = key;
     }
+    const arandu::Graph& g = warm.g;
     const double t_build = secs(t0, clk::now());
 
     arandu::Profiler prof;
@@ -340,7 +409,7 @@ int main(int argc, char** argv) {
     pol.determinism = spec.get("determinism", "tolerant") == "bitexact"
                           ? arandu::Determinism::BitExact : arandu::Determinism::Tolerant;
     pol.device = spec.get("device", "cuda") == "cpu" ? arandu::Device::Cpu : arandu::Device::Cuda;
-    pol.gpu_id = run_gpu;               // o mesmo número que a sessão ONNX recebeu
+    pol.gpu_id = run_gpu;               // the same number the ONNX session got
     pol.cpu_threads = spec.get_int("threads", 8);
     pol.max_batch = spec.get_int("batch", 8);
     pol.channel_depth = spec.get_int("depth", 4);
@@ -349,7 +418,7 @@ int main(int argc, char** argv) {
     // fallback silently (7% slower, nothing complains). Defaulted to 1 here for that
     // reason; `@streams 0` still forces the fallback on purpose.
     pol.gpu_streams = spec.get_int("streams", 1);
-    pol.model_actors = spec.get_int("actors", 2);
+    pol.model_actors = run_actors;      // the same number that sized the session's threads
     pol.profiler = &prof;
 
     // Which implementation each phase resolved to, decided BEFORE the run and reported
@@ -377,7 +446,13 @@ int main(int argc, char** argv) {
             out = arandu::PipelineExecutor{pol}.run(g, input);
     } catch (const std::exception& exc) {
         std::fprintf(stderr, "graph_run: run failed: %s\n", exc.what());
+        std::fflush(stderr);
         std::printf("{\"ok\":false,\"error\":\"%s\"}\n", esc(exc.what()).c_str());
+        std::fflush(stdout);
+        // A failed run says nothing about the session's health, but it says nothing
+        // GOOD either -- drop the warm graph so the next request rebuilds rather than
+        // inheriting whatever state the exception left.
+        warm.drop();
         return 4;
     }
     const double wall = secs(t1, clk::now());
@@ -396,12 +471,77 @@ int main(int argc, char** argv) {
     }
 
     if (want_profile) std::fprintf(stderr, "%s\n", prof.markdown().c_str());
+    // Flushed BEFORE the summary line, because the summary is what a caller waits for:
+    // a server that reads stderr after seeing it would otherwise race the child's buffer.
+    std::fflush(stderr);
 
     std::printf("{\"ok\":true,\"images\":%zu,\"completed\":%zu,\"counted\":%d,"
                 "\"minutiae\":%ld,\"wall_s\":%.3f,\"img_per_s\":%.3f,\"build_s\":%.3f,"
-                "\"sink\":\"%s\",\"phases\":[%s],\"items\":[%s]}\n",
+                "\"warm\":%s,\"sink\":\"%s\",\"phases\":[%s],\"items\":[%s]}\n",
                 out.size(), out.size(), counted, total_minutiae, wall,
-                wall > 0 ? out.size() / wall : 0.0, t_build, esc(g.sink).c_str(),
-                phases.c_str(), per_item.c_str());
+                wall > 0 ? out.size() / wall : 0.0, t_build, reuse ? "true" : "false",
+                esc(g.sink).c_str(), phases.c_str(), per_item.c_str());
+    std::fflush(stdout);
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    bool serve = false, want_profile = false;
+    std::string spec_path;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--serve") serve = true;
+        else if (a == "--profile") want_profile = true;
+        else spec_path = a;
+    }
+    register_types();
+    Warm warm;
+
+    if (!serve) {
+        if (spec_path.empty())
+            die("usage: graph_run <spec-file> [--profile] | graph_run --serve [--profile]");
+        try {
+            return run_once(read_spec(spec_path), want_profile, warm);
+        } catch (const std::exception& exc) {
+            std::fflush(stderr);
+            std::printf("{\"ok\":false,\"error\":\"%s\"}\n", esc(exc.what()).c_str());
+            die(exc.what());
+        }
+    }
+
+    // ── serve: one spec path per line, one JSON line back ────────────────────
+    //
+    // EOF ENDS THE PROCESS, and that is the whole lifecycle contract: the caller holds the
+    // write end of this pipe, so if the caller dies -- gracefully, killed, or crashed --
+    // the read here returns EOF and the runner exits. No pidfile, no supervisor, and no
+    // orphaned process holding a GPU because a server was SIGKILLed.
+    //
+    // A line may carry `<path>\t--profile` to ask for the profiler's markdown on stderr
+    // for that request only: a warm runner outlives the mood it was started in.
+    std::printf("{\"ok\":true,\"ready\":true}\n");
+    std::fflush(stdout);
+    for (std::string line; std::getline(std::cin, line);) {
+        line = trim(line);
+        if (line.empty()) continue;
+        if (line == "quit") break;
+        std::string path = line;
+        bool prof = want_profile;
+        const size_t tab = line.find('\t');
+        if (tab != std::string::npos) {          // the flag is the field AFTER the tab,
+            path = trim(line.substr(0, tab));    // not a substring of the path
+            prof = prof || trim(line.substr(tab + 1)) == "--profile";
+        }
+        try {
+            run_once(read_spec(path), prof, warm);
+        } catch (const std::exception& exc) {
+            std::fprintf(stderr, "graph_run: %s\n", exc.what());
+            std::fflush(stderr);
+            std::printf("{\"ok\":false,\"error\":\"%s\"}\n", esc(exc.what()).c_str());
+            std::fflush(stdout);
+        }
+        std::fflush(stderr);
+    }
     return 0;
 }

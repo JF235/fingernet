@@ -2,6 +2,19 @@
 // encoder produces a file that decodes back to the exact pixel array -> the
 // parity gate is on DECODED pixels, never on file bytes (PIL/zlib settings
 // differ from libpng and would never byte-match, without any pixel difference).
+//
+// Which is what makes the COMPRESSION LEVEL a free throughput knob here, and it is not a
+// small one. Writing this pipeline's four maps for one 512x512 image, 10 repetitions:
+//
+//   level    ms/image   bytes/image
+//   9           461.6       210 176
+//   6           76.2        214 965      <- libpng's default
+//   3           34.3        221 327      <- kDefaultLevel
+//   1           25.9        233 916
+//
+// So libpng's default was 76 ms of the sink's 82 ms/item: the extraction's bottleneck was
+// zlib. Level 3 is 2.2x faster for 3% more bytes; 9 costs 6x the time to save 2% and
+// exists only for an archive.
 #pragma once
 #include <png.h>
 
@@ -12,6 +25,10 @@
 #include <vector>
 
 namespace fnpng {
+
+/// zlib effort every writer here defaults to. One place, because a default repeated at
+/// each call site is a default that drifts. See the table above for why it is 3.
+inline constexpr int kDefaultLevel = 3;
 
 // Read an 8-bit grayscale PNG (expands palette/RGB/<8bpp to 8-bit gray, strips
 // alpha/16-bit). SD258 is already 8-bit gray so this is a direct read matching
@@ -48,7 +65,8 @@ inline std::vector<uint8_t> read_gray(const std::string& path, int& H, int& W) {
     return img;
 }
 
-inline void write_gray(const std::string& path, const uint8_t* data, int H, int W) {
+inline void write_gray(const std::string& path, const uint8_t* data, int H, int W,
+                       int level = kDefaultLevel) {
     FILE* fp = std::fopen(path.c_str(), "wb");
     if (!fp) throw std::runtime_error("png: cannot open " + path);
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
@@ -59,6 +77,9 @@ inline void write_gray(const std::string& path, const uint8_t* data, int H, int 
         throw std::runtime_error("png: write failure for " + path);
     }
     png_init_io(png, fp);
+    // Clamped rather than validated: a spec that asks for 12 gets the best libpng has,
+    // and no caller has to learn zlib's range to write a picture.
+    png_set_compression_level(png, level < 0 ? 0 : (level > 9 ? 9 : level));
     png_set_IHDR(png, info, static_cast<png_uint_32>(W), static_cast<png_uint_32>(H), 8,
                  PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
                  PNG_FILTER_TYPE_DEFAULT);

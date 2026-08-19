@@ -45,7 +45,11 @@ struct LoadNode : arandu::ICpuScript<PathItem, InputImage> {
 // disagree with the producer's, which is how a null deref used to get past build().
 struct SerializeNode : arandu::ICpuScript<FnetProducts, Written> {
     std::string out;
-    explicit SerializeNode(std::string o) : out(std::move(o)) {}
+    // zlib effort for every PNG this writes. Not libpng's 6: that level was 76 ms of this
+    // node's 82 ms/item, and PNG being lossless it changes the file size, never a pixel.
+    int png_level;
+    explicit SerializeNode(std::string o, int level = fnpng::kDefaultLevel)
+        : out(std::move(o)), png_level(level) {}
     static std::vector<uint8_t> crop(const std::vector<uint8_t>& s, int W, int oh, int ow) {
         std::vector<uint8_t> d(static_cast<size_t>(oh) * ow);
         for (int y = 0; y < oh; ++y)
@@ -58,7 +62,7 @@ struct SerializeNode : arandu::ICpuScript<FnetProducts, Written> {
         fs::path p = fs::path(out) / sub / (id + ".png");
         fs::create_directories(p.parent_path());
         auto c = (oh == (int)(px.size() / W) && ow == W) ? px : crop(px, W, oh, ow);
-        fnpng::write_gray(p.string(), c.data(), oh, ow);
+        fnpng::write_gray(p.string(), c.data(), oh, ow, png_level);
     }
     void save_min(const std::string& sub, const std::string& id,
                   const std::vector<fnpost::Minutia>& m) const {

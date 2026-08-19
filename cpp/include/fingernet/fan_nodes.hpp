@@ -145,7 +145,9 @@ struct Minutiae : arandu::IJoin2<FnetRaw, MaskProduct, MinutiaeProduct> {
 struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
                                   OriProduct, EnhancedProduct, MinutiaeProduct> {
     std::string out;
-    explicit Serialize(std::string o) : out(std::move(o)) {}
+    int png_level;      // see png.hpp: zlib effort, and the whole cost of this node
+    explicit Serialize(std::string o, int level = fnpng::kDefaultLevel)
+        : out(std::move(o)), png_level(level) {}
 
     void run(std::span<const FnetRaw> raw, std::span<const MaskProduct> mask,
              std::span<const QualityProduct> quality, std::span<const OriProduct> ori,
@@ -154,7 +156,7 @@ struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
         // The writing itself is SerializeNode's, reused rather than copied: the file
         // names, the crop and the .min conversion are contract with api.py, and a
         // second copy of them is a second thing to keep in step.
-        const SerializeNode writer(out);
+        const SerializeNode writer(out, png_level);
         for (size_t i = 0; i < raw.size(); ++i) {
             const RawImage& r = *raw[i].raw;
             if (out == "none") {

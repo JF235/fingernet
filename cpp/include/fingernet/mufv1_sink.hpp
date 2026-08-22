@@ -35,7 +35,10 @@
 #include <utility>
 #include <vector>
 
+#include "arandu_nodes.hpp"   // RawImage: a grade da rede vem dele
+#include "minfmt.hpp"         // to_min: as minúcias no domínio do .min
 #include "mufv1/bundle.hpp"
+#include "mufv1/fingernet.hpp"
 #include "mufv1/mufv1.hpp"
 #include "postproc.hpp"
 
@@ -156,83 +159,36 @@ inline FingerData coarse_of(const RawImage& r, const std::vector<float>& cleaned
 }
 
 /// Os quatro blocos, na ordem em que fingernet.py os adiciona -- que é a ordem no schema, e
-/// o `support` de um bloco aponta para um id que já tem de existir.
+/// o `support` de um bloco aponta para um id que já tem de existir. O QUE cada bloco é vive
+/// em mufv1/fingernet.hpp, declarado uma vez; aqui só se diz com que dados preenchê-los.
 inline mufv1::Record record_of(const Ident& idt, const std::vector<FingerData>& fingers,
                                const std::string& theta_dtype) {
     mufv1::Record rec(idt.dataset, idt.iid, idt.sid);
     for (const auto& f : fingers) rec.add_finger(f.meta);
 
-    const bool u8 = theta_dtype == "u8";
-    mufv1::Block mb;
-    mb.kind = "POINTS";
-    mb.bid = mufv1::kMinutiae;
-    mb.name = "minutiae";
-    mb.codec = "zstd";
-    mb.attrs = {
-        {"x", "u16", 1.0, 0.0, "px", "", 0},
-        {"y", "u16", 1.0, 0.0, "px", "", 0},
-        {"theta", u8 ? "u8" : "u16", u8 ? 2.0 : 1.0, 0.0, "deg", "iso", 360},
-        {"quality", "u8", 1.0, 0.0, "", "", 0},
-        {"type", "u8", 1.0, 0.0, "", "", 0},
-    };
     std::vector<std::vector<std::vector<double>>> mnt;
     for (const auto& f : fingers) mnt.push_back(f.mnt);
-    rec.add_points(mb, mnt);
+    rec.add_points(mufv1::fnet::minutiae_block(theta_dtype), mnt);
 
-    mufv1::Grid g;
-    g.cell = 8;
-    g.offset = 0;
-    g.rows = fingers.empty() ? 0 : fingers[0].rows;
-    g.cols = fingers.empty() ? 0 : fingers[0].cols;
-
+    const mufv1::Grid g = mufv1::fnet::grid_of(fingers.empty() ? 0 : fingers[0].rows,
+                                               fingers.empty() ? 0 : fingers[0].cols);
     std::vector<std::vector<std::uint8_t>> mask, quality, ori;
     for (const auto& f : fingers) {
         mask.push_back(f.mask);
         quality.push_back(f.quality);
         ori.push_back(f.orientation);
     }
-
-    mufv1::Block bm;
-    bm.kind = "RASTER";
-    bm.bid = mufv1::kMask;
-    bm.name = "mask";
-    bm.codec = "bitpack+zstd";
-    bm.semantic = "binary";
-    bm.dtype = "u1";
-    bm.upsample = "nearest";
-    bm.has_grid = true;
-    bm.grid = g;
-    rec.add_raster(bm, mask);
-
-    mufv1::Block bq;
-    bq.kind = "RASTER";
-    bq.bid = mufv1::kQuality;
-    bq.name = "quality";
-    bq.codec = "zstd";
-    bq.semantic = "scalar";
-    bq.dtype = "u8";
-    bq.upsample = "bilinear";
-    bq.has_grid = true;
-    bq.grid = g;
-    bq.support = mufv1::kMask;
-    bq.attrs = {{"quality", "u8", 100.0 / 255.0, 0.0, "pct", "", 0}};
-    rec.add_raster(bq, quality, mask);
-
-    mufv1::Block bo;
-    bo.kind = "RASTER";
-    bo.bid = mufv1::kOrientation;
-    bo.name = "orientation";
-    bo.codec = "zstd";
-    bo.semantic = "axial";
-    bo.dtype = "u8";
-    bo.upsample = "nearest";
-    bo.has_grid = true;
-    bo.grid = g;
-    bo.support = mufv1::kMask;
-    bo.attrs = {{"theta", "u8", 1.0, -90.0, "deg", "standard", 180}};
-    rec.add_raster(bo, ori, mask);
+    rec.add_raster(mufv1::fnet::mask_block(g), mask);
+    rec.add_raster(mufv1::fnet::quality_block(g), quality, mask);
+    rec.add_raster(mufv1::fnet::orientation_block(g), ori, mask);
     return rec;
 }
+
+/// O que uma corrida escreveu, e o que ela não precisou escrever.
+struct Tally {
+    std::size_t written = 0;
+    std::size_t skipped = 0;      // já estavam no bundle (a regra 3 do formato)
+};
 
 /// Onde os templates vão parar, nos três modos que os escrevem.
 ///
@@ -299,10 +255,11 @@ public:
     /// pendentes, e o bundle ficaria com um descritor aberto num arquivo que o Run seguinte
     /// apaga (a pasta de rascunho é limpa antes de cada um). Chamado pelo `graph_run`
     /// depois de o executor voltar; o bundle reabre na próxima escrita.
-    /// Devolve quantos templates ESTA corrida escreveu, e zera a conta. Com o grafo
-    /// quente o mesmo writer serve várias corridas, e um contador que acumula reportaria
-    /// 12 na segunda passada de 6 imagens.
-    std::size_t finish() {
+    /// O que ESTA corrida fez, e zera a conta. Com o grafo quente o mesmo writer serve
+    /// várias corridas, e um contador que acumula reportaria 12 na segunda passada de 6
+    /// imagens. `skipped` é o que o manifest do bundle já tinha: é a diferença entre "nada
+    /// aconteceu" e "nada precisava acontecer".
+    Tally finish() {
         std::lock_guard<std::mutex> lk(mx_);
         for (auto& [key, val] : pending_) {
             const fs::path dest = out_ / key.first / (key.second + ".mufi");
@@ -311,10 +268,10 @@ public:
         }
         pending_.clear();
         bundle_.reset();                // fecha; a próxima escrita reabre no destino atual
-        const std::size_t n = written_;
+        const Tally t{written_, skipped_};
         written_ = 0;
         skipped_ = 0;
-        return n;
+        return t;
     }
 
 private:
@@ -326,7 +283,7 @@ private:
     std::map<std::pair<std::string, std::string>,
              std::pair<Ident, std::vector<FingerData>>> pending_;
     std::size_t written_ = 0;
-    std::size_t skipped_ = 0;      // já estavam no bundle (regra 3)
+    std::size_t skipped_ = 0;
 };
 
 }  // namespace fnaru::mufv1out

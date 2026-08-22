@@ -32,10 +32,8 @@
 #include "arandu_nodes.hpp"
 #include "io_nodes.hpp"     // Written + SerializeNode's writing (and so libpng)
 #include "minfmt.hpp"
-#include "postproc.hpp"
-#ifdef FINGERNET_WITH_MUFV1
 #include "mufv1_sink.hpp"   // o template escrito do batch em memória
-#endif
+#include "postproc.hpp"
 
 namespace fnaru::fan {
 
@@ -163,36 +161,24 @@ struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
     int png_level;      // see png.hpp: zlib effort, and the whole cost of this node
     std::string mode;
     std::string theta_dtype;
-#ifdef FINGERNET_WITH_MUFV1
     // O writer é do NÓ e não da chamada: o bundle é um arquivo aberto durante a corrida
     // toda, e o per-identity só sabe que uma identidade terminou quando a corrida termina.
+    // Nulo no modo `products` e quando `out` é o sentinela "none".
     mutable std::shared_ptr<mufv1out::Writer> tpl;
-#endif
-    /// Chamado pelo driver quando o executor volta. Ver mufv1out::Writer::finish: com o
-    /// grafo quente entre Runs, o fim de uma corrida não é o fim do nó.
-    /// Devolve quantos templates a corrida que acabou escreveu.
-    std::size_t finish_run() const {
-#ifdef FINGERNET_WITH_MUFV1
-        return tpl ? tpl->finish() : 0;
-#else
-        return 0;
-#endif
-    }
 
     explicit Serialize(std::string o, int level = fnpng::kDefaultLevel,
                        std::string m = "products", std::string theta = "u16")
         : out(std::move(o)), png_level(level), mode(std::move(m)),
           theta_dtype(std::move(theta)) {
-#ifdef FINGERNET_WITH_MUFV1
         const mufv1out::Mode md = mufv1out::mode_of(mode);
         if (md != mufv1out::Mode::Products && out != "none")
             tpl = std::make_shared<mufv1out::Writer>(md, out, theta_dtype);
-#else
-        if (mode != "products")
-            throw std::runtime_error("modo '" + mode + "' precisa do mufv1: reconstrua com "
-                                     "-DMUFV1_INCLUDE=<mufis>/src");
-#endif
     }
+
+    /// Chamado pelo driver quando o executor volta, e devolve quantos templates a corrida
+    /// escreveu. Ver mufv1out::Writer::finish: com o grafo quente entre Runs, o fim de uma
+    /// corrida não é o fim do nó.
+    mufv1out::Tally finish_run() const { return tpl ? tpl->finish() : mufv1out::Tally{}; }
 
     void run(std::span<const FnetRaw> raw, std::span<const MaskProduct> mask,
              std::span<const QualityProduct> quality, std::span<const OriProduct> ori,
@@ -208,7 +194,6 @@ struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
                 outv[i] = Written{r.id, static_cast<int>(mnt[i].minutiae->size())};
                 continue;
             }
-#ifdef FINGERNET_WITH_MUFV1
             // Os modos de template NÃO escrevem produto nenhum: a grade da rede vai
             // direto para os blocos, e é dela que os produtos seriam derivados.
             if (tpl) {
@@ -224,7 +209,6 @@ struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
                 outv[i] = Written{r.id, static_cast<int>(mnt[i].minutiae->size())};
                 continue;
             }
-#endif
             writer.save("enhanced", r.id, *enh[i].image, r.W, r.orig_h, r.orig_w);
             writer.save("mask", r.id, *mask[i].segmentation_mask, r.W, r.orig_h, r.orig_w);
             writer.save("quality", r.id, *quality[i].quality, r.W, r.orig_h, r.orig_w);

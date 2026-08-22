@@ -54,7 +54,14 @@ if(FINGERNET_WITH_ONNX)
   if(NOT ORT_LIBFILE OR NOT ORT_INCLUDE)
     message(FATAL_ERROR "FINGERNET_WITH_ONNX needs -DORT_LIBFILE=<lib> -DORT_INCLUDE=<inc>")
   endif()
-  if(EXISTS "${ARANDU_ROOT}/include/arandu/graph.hpp" AND PNG_FOUND)
+  # mufv1 é exigido, como o arandu: o sink escreve template, e um sink que compila sem
+  # saber escrever template precisaria de um #ifdef em cada método dele. Faltando, os alvos
+  # do grafo são PULADOS com a razão -- a mesma regra que o arandu já segue aqui.
+  if(NOT EXISTS "${MUFV1_INCLUDE}/mufv1/mufv1.hpp")
+    message(STATUS "mufv1 não encontrado em ${MUFV1_INCLUDE}; pulando os alvos do grafo")
+  elseif(NOT ZSTD_LIB)
+    message(STATUS "libzstd não encontrada (o codec do mufv1); pulando os alvos do grafo")
+  elseif(EXISTS "${ARANDU_ROOT}/include/arandu/graph.hpp" AND PNG_FOUND)
     # graph_run is full_graph with the wiring moved out of C++ and into a spec file:
     # the same nodes, assembled through arandu::NodeRegistry, so a graph drawn in a UI
     # is a graph this can run.
@@ -63,16 +70,8 @@ if(FINGERNET_WITH_ONNX)
       target_include_directories(${tgt} PRIVATE ${ARANDU_ROOT}/include ${ORT_INCLUDE})
       target_link_libraries(${tgt} PRIVATE fingernet_postproc PNG::PNG ${ORT_LIBFILE} Threads::Threads)
       target_compile_definitions(${tgt} PRIVATE FINGERNET_WITH_ONNX)
-      # O template exige as duas coisas: os headers do mufv1 e a libzstd (o codec dele).
-      # Faltando qualquer uma, o sink continua escrevendo produtos e recusa os outros modos
-      # com uma mensagem que diz o que reconstruir.
-      if(EXISTS "${MUFV1_INCLUDE}/mufv1/mufv1.hpp" AND ZSTD_LIB)
-        target_include_directories(${tgt} PRIVATE ${MUFV1_INCLUDE})
-        target_link_libraries(${tgt} PRIVATE ${ZSTD_LIB})
-        target_compile_definitions(${tgt} PRIVATE FINGERNET_WITH_MUFV1)
-      else()
-        message(STATUS "mufv1 não encontrado em ${MUFV1_INCLUDE}; o sink só escreve produtos")
-      endif()
+      target_include_directories(${tgt} PRIVATE ${MUFV1_INCLUDE})
+      target_link_libraries(${tgt} PRIVATE ${ZSTD_LIB})
       if(ORT_LIBDIR)
         set_target_properties(${tgt} PROPERTIES BUILD_RPATH ${ORT_LIBDIR} INSTALL_RPATH ${ORT_LIBDIR})
       endif()

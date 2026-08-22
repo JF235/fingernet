@@ -483,8 +483,12 @@ int run_once(const Spec& spec, bool want_profile, Warm& warm) {
     }
     // O FIM DA CORRIDA, anunciado. O per-identity esvazia os pendentes aqui e o bundle
     // fecha; com o grafo quente, nenhum dos dois aconteceria por destrutor.
-    std::size_t templates = 0;
-    for (const auto& s : run_sinks) templates += s->finish_run();
+    std::size_t templates = 0, templates_skipped = 0;
+    for (const auto& s : run_sinks) {
+        const auto t = s->finish_run();
+        templates += t.written;
+        templates_skipped += t.skipped;
+    }
     const double wall = secs(t1, clk::now());
 
     long total_minutiae = 0;
@@ -507,11 +511,14 @@ int run_once(const Spec& spec, bool want_profile, Warm& warm) {
 
     std::printf("{\"ok\":true,\"images\":%zu,\"completed\":%zu,\"counted\":%d,"
                 "\"minutiae\":%ld,\"wall_s\":%.3f,\"img_per_s\":%.3f,\"build_s\":%.3f,"
-                "\"warm\":%s,\"templates\":%zu,\"sink\":\"%s\",\"phases\":[%s],"
-                "\"items\":[%s]}\n",
+                // `templates_written`, e não `templates`: o servidor põe um OBJETO em
+                // `templates` (o que ele empacotou), e o número do runner era sobrescrito.
+                "\"warm\":%s,\"templates_written\":%zu,\"templates_skipped\":%zu,"
+                "\"sink\":\"%s\",\"phases\":[%s],\"items\":[%s]}\n",
                 out.size(), out.size(), counted, total_minutiae, wall,
                 wall > 0 ? out.size() / wall : 0.0, t_build, reuse ? "true" : "false",
-                templates, esc(g.sink).c_str(), phases.c_str(), per_item.c_str());
+                templates, templates_skipped, esc(g.sink).c_str(), phases.c_str(),
+                per_item.c_str());
     std::fflush(stdout);
     return 0;
 }

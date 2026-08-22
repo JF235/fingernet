@@ -13,6 +13,8 @@
 // ignored, everything TAB-separated:
 //
 //   @images   <dir|list.txt>        run-level settings, one per line
+//                                  a list is `<path>` or `<path><TAB><id>`, and the
+//                                  id is what the sink names its output after
 //   @exec     pipeline|serial
 //   @threads  12
 //   ...
@@ -293,9 +295,23 @@ std::vector<PathItem> collect(const std::string& images) {
     if (images.size() > 4 && images.compare(images.size() - 4, 4, ".txt") == 0) {
         std::ifstream f(images);
         if (!f) throw std::runtime_error("cannot read list " + images);
+        // `<path>` ou `<path>\t<id>`. O ID é o que o sink usa para nomear a saída, então
+        // quem monta a lista é quem decide a ESTRUTURA que ela reproduz: sem ele, o stem
+        // sozinho achata `0001/01/sd4_....png` numa pasta só, e uma extração de base perde
+        // a árvore `{IID}/{SID}/` que a base tinha. Uma pasta como @images já preservava
+        // isso (lexically_relative, abaixo); uma lista não tinha como dizer.
         for (std::string line; std::getline(f, line);) {
             line = trim(line);
-            if (!line.empty()) items.push_back({line, fs::path(line).stem().string()});
+            if (line.empty()) continue;
+            const size_t tab = line.find('\t');
+            if (tab == std::string::npos) {
+                items.push_back({line, fs::path(line).stem().string()});
+                continue;
+            }
+            const std::string path = trim(line.substr(0, tab));
+            const std::string id = trim(line.substr(tab + 1));
+            if (path.empty()) continue;
+            items.push_back({path, id.empty() ? fs::path(path).stem().string() : id});
         }
     } else {
         if (!fs::exists(images)) throw std::runtime_error("no such path: " + images);

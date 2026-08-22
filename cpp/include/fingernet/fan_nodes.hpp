@@ -23,6 +23,7 @@
 // offers; the chain retires once this one has carried a full run.
 #pragma once
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,6 +33,9 @@
 #include "io_nodes.hpp"     // Written + SerializeNode's writing (and so libpng)
 #include "minfmt.hpp"
 #include "postproc.hpp"
+#ifdef FINGERNET_WITH_MUFV1
+#include "mufv1_sink.hpp"   // o template escrito do batch em memória
+#endif
 
 namespace fnaru::fan {
 
@@ -142,12 +146,53 @@ struct Minutiae : arandu::IJoin2<FnetRaw, MaskProduct, MinutiaeProduct> {
 
 // ── the sink: six inputs, because it reads six things ───────────────────────
 
+// UM MODO, UMA PASTA, NENHUM BYTE ESCRITO DUAS VEZES.
+//
+// O sink escreve os cinco produtos OU um template, e o `mode` decide qual. Não é uma
+// escolha de conveniência: o template não precisa dos produtos em disco para existir --
+// ele é montado do batch que está em memória (ver mufv1_sink.hpp) -- então escrever os dois
+// seria escrever a mesma informação duas vezes, uma delas em 31x o tamanho.
+//
+//   products      <out>/<produto>/<id>.png|.min
+//   bundle        <out>/templates.mufi + .manifest.jsonl
+//   per-image     <out>/<id>.mufi
+//   per-identity  <out>/<iid>/<sid>.mufi
 struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
                                   OriProduct, EnhancedProduct, MinutiaeProduct> {
     std::string out;
     int png_level;      // see png.hpp: zlib effort, and the whole cost of this node
-    explicit Serialize(std::string o, int level = fnpng::kDefaultLevel)
-        : out(std::move(o)), png_level(level) {}
+    std::string mode;
+    std::string theta_dtype;
+#ifdef FINGERNET_WITH_MUFV1
+    // O writer é do NÓ e não da chamada: o bundle é um arquivo aberto durante a corrida
+    // toda, e o per-identity só sabe que uma identidade terminou quando a corrida termina.
+    mutable std::shared_ptr<mufv1out::Writer> tpl;
+#endif
+    /// Chamado pelo driver quando o executor volta. Ver mufv1out::Writer::finish: com o
+    /// grafo quente entre Runs, o fim de uma corrida não é o fim do nó.
+    /// Devolve quantos templates a corrida que acabou escreveu.
+    std::size_t finish_run() const {
+#ifdef FINGERNET_WITH_MUFV1
+        return tpl ? tpl->finish() : 0;
+#else
+        return 0;
+#endif
+    }
+
+    explicit Serialize(std::string o, int level = fnpng::kDefaultLevel,
+                       std::string m = "products", std::string theta = "u16")
+        : out(std::move(o)), png_level(level), mode(std::move(m)),
+          theta_dtype(std::move(theta)) {
+#ifdef FINGERNET_WITH_MUFV1
+        const mufv1out::Mode md = mufv1out::mode_of(mode);
+        if (md != mufv1out::Mode::Products && out != "none")
+            tpl = std::make_shared<mufv1out::Writer>(md, out, theta_dtype);
+#else
+        if (mode != "products")
+            throw std::runtime_error("modo '" + mode + "' precisa do mufv1: reconstrua com "
+                                     "-DMUFV1_INCLUDE=<mufis>/src");
+#endif
+    }
 
     void run(std::span<const FnetRaw> raw, std::span<const MaskProduct> mask,
              std::span<const QualityProduct> quality, std::span<const OriProduct> ori,
@@ -163,6 +208,23 @@ struct Serialize : arandu::IJoinN<Written, FnetRaw, MaskProduct, QualityProduct,
                 outv[i] = Written{r.id, static_cast<int>(mnt[i].minutiae->size())};
                 continue;
             }
+#ifdef FINGERNET_WITH_MUFV1
+            // Os modos de template NÃO escrevem produto nenhum: a grade da rede vai
+            // direto para os blocos, e é dela que os produtos seriam derivados.
+            if (tpl) {
+                const mufv1out::Ident idt = mufv1out::ident_of(r.id);
+                mufv1out::FingerData fd = mufv1out::coarse_of(
+                    r, *mask[i].cleaned, *mnt[i].minutiae, r.id);
+                fd.meta.fid = idt.fid;
+                fd.meta.width = r.orig_w;
+                fd.meta.height = r.orig_h;
+                fd.meta.ppi = 500;
+                fd.meta.name = r.id.substr(r.id.find_last_of('/') + 1) + ".png";
+                tpl->put(idt, std::move(fd));
+                outv[i] = Written{r.id, static_cast<int>(mnt[i].minutiae->size())};
+                continue;
+            }
+#endif
             writer.save("enhanced", r.id, *enh[i].image, r.W, r.orig_h, r.orig_w);
             writer.save("mask", r.id, *mask[i].segmentation_mask, r.W, r.orig_h, r.orig_w);
             writer.save("quality", r.id, *quality[i].quality, r.W, r.orig_h, r.orig_w);

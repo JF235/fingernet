@@ -51,6 +51,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -193,6 +194,13 @@ int run_gpu = 0;
 /// constructor (see FingernetOnnx's runner), and a constructor runs inside build().
 int run_actors = 2;
 
+/// Os sinks de template que o grafo ATUAL tem, para o fim de cada corrida poder ser
+/// anunciado a eles. Vive aqui pela mesma razão que `run_gpu`: a fábrica do nó é o único
+/// lugar que vê o objeto, e o driver é o único que sabe quando o executor voltou. Não é
+/// limpo entre corridas — é limpo quando um grafo NOVO é construído, porque um grafo quente
+/// mantém os seus nós.
+std::vector<std::shared_ptr<fan::Serialize>> run_sinks;
+
 bool truthy(const std::string& v) { return v == "1" || v == "true" || v == "on"; }
 
 /// Arity, checked with the node's NAME in the message. GraphBuilder checks it too, but
@@ -266,10 +274,11 @@ void register_types() {
     });
     R.reg("serialize", [](arandu::GraphBuilder& gb, const arandu::NodeConfig& c) {
         need_inputs(c, 6);
-        gb.addN(c.name,
-                std::make_shared<fan::Serialize>(
-                    c.get("out", "none"), c.get_int("png_level", fnpng::kDefaultLevel)),
-                c.inputs);
+        auto sink = std::make_shared<fan::Serialize>(
+            c.get("out", "none"), c.get_int("png_level", fnpng::kDefaultLevel),
+            c.get("mode", "products"), c.get("theta_dtype", "u16"));
+        run_sinks.push_back(sink);
+        gb.addN(c.name, sink, c.inputs);
     });
 
     // The fused postproc and its 1-input sink: same math, one phase instead of six.
@@ -403,6 +412,7 @@ int run_once(const Spec& spec, bool want_profile, Warm& warm) {
         // twice the workspace for one run's worth of work, and on a shared box that is
         // the difference between a rebuild and an OOM.
         warm.drop();
+        run_sinks.clear();                  // os do grafo antigo foram com ele
         try {
             warm.g = arandu::NodeRegistry::instance().build(spec.nodes);
         } catch (const std::exception& exc) {
@@ -471,6 +481,10 @@ int run_once(const Spec& spec, bool want_profile, Warm& warm) {
         warm.drop();
         return 4;
     }
+    // O FIM DA CORRIDA, anunciado. O per-identity esvazia os pendentes aqui e o bundle
+    // fecha; com o grafo quente, nenhum dos dois aconteceria por destrutor.
+    std::size_t templates = 0;
+    for (const auto& s : run_sinks) templates += s->finish_run();
     const double wall = secs(t1, clk::now());
 
     long total_minutiae = 0;
@@ -493,10 +507,11 @@ int run_once(const Spec& spec, bool want_profile, Warm& warm) {
 
     std::printf("{\"ok\":true,\"images\":%zu,\"completed\":%zu,\"counted\":%d,"
                 "\"minutiae\":%ld,\"wall_s\":%.3f,\"img_per_s\":%.3f,\"build_s\":%.3f,"
-                "\"warm\":%s,\"sink\":\"%s\",\"phases\":[%s],\"items\":[%s]}\n",
+                "\"warm\":%s,\"templates\":%zu,\"sink\":\"%s\",\"phases\":[%s],"
+                "\"items\":[%s]}\n",
                 out.size(), out.size(), counted, total_minutiae, wall,
                 wall > 0 ? out.size() / wall : 0.0, t_build, reuse ? "true" : "false",
-                esc(g.sink).c_str(), phases.c_str(), per_item.c_str());
+                templates, esc(g.sink).c_str(), phases.c_str(), per_item.c_str());
     std::fflush(stdout);
     return 0;
 }

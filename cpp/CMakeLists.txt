@@ -41,6 +41,14 @@ endif()
 
 # Complete end-to-end graph: load -> ONNX(fingernet) -> postproc -> serialize.
 # Needs ONNX Runtime (GPU capi ok). Provide -DORT_LIBFILE, -DORT_INCLUDE, -DORT_LIBDIR.
+# mufv1 -- o formato de template do mufis, header-only. Com ele o sink escreve o template
+# DO BATCH EM MEMÓRIA, sem a ida e volta pelos PNGs; sem ele, o sink só escreve produtos.
+# Aponta para o checkout irmão, como ARANDU_ROOT.
+set(MUFV1_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../mufis/src"
+    CACHE PATH "mufis src/ dir (para mufv1/*.hpp)")
+find_library(ZSTD_LIB NAMES zstd libzstd.so.1
+             PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib)
+
 option(FINGERNET_WITH_ONNX "Build the complete ONNX end-to-end graph" OFF)
 if(FINGERNET_WITH_ONNX)
   if(NOT ORT_LIBFILE OR NOT ORT_INCLUDE)
@@ -55,6 +63,16 @@ if(FINGERNET_WITH_ONNX)
       target_include_directories(${tgt} PRIVATE ${ARANDU_ROOT}/include ${ORT_INCLUDE})
       target_link_libraries(${tgt} PRIVATE fingernet_postproc PNG::PNG ${ORT_LIBFILE} Threads::Threads)
       target_compile_definitions(${tgt} PRIVATE FINGERNET_WITH_ONNX)
+      # O template exige as duas coisas: os headers do mufv1 e a libzstd (o codec dele).
+      # Faltando qualquer uma, o sink continua escrevendo produtos e recusa os outros modos
+      # com uma mensagem que diz o que reconstruir.
+      if(EXISTS "${MUFV1_INCLUDE}/mufv1/mufv1.hpp" AND ZSTD_LIB)
+        target_include_directories(${tgt} PRIVATE ${MUFV1_INCLUDE})
+        target_link_libraries(${tgt} PRIVATE ${ZSTD_LIB})
+        target_compile_definitions(${tgt} PRIVATE FINGERNET_WITH_MUFV1)
+      else()
+        message(STATUS "mufv1 não encontrado em ${MUFV1_INCLUDE}; o sink só escreve produtos")
+      endif()
       if(ORT_LIBDIR)
         set_target_properties(${tgt} PROPERTIES BUILD_RPATH ${ORT_LIBDIR} INSTALL_RPATH ${ORT_LIBDIR})
       endif()

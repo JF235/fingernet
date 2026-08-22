@@ -28,3 +28,11 @@ compile_commands.json
 *.onnx
 *.engine
 *.plan
+
+# ---- generated artefacts that had been committed ------------------------------
+# Same reason as the build trees above: a 19 MB profiler trace and a 1.3 MB figure are
+# OUTPUT, and carrying them made them a third of this repo's packed size. They stay on
+# disk; git stops shipping them. `.claude/` is tool config, and no sibling repo tracks it.
+docs/profile_trace.json
+docs/fingernet_grid.png
+.claude/

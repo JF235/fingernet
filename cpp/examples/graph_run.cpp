@@ -155,6 +155,15 @@ Spec read_spec(const std::string& path) {
 struct ProbeShape { int h = 0, w = 0; };
 ProbeShape probe_shape;
 
+/// Which GPU this run uses, from the RUN settings (`@gpu`) and not from a node.
+///
+/// Which GPU is POLICY, like threads and batch: the same graph runs on 0 today and on 3
+/// tomorrow, and a node that names a device makes "run this somewhere else" an edit to the
+/// pipeline. It lives here rather than in `pol` because the node factory runs inside
+/// `build()` -- before a policy exists -- and the ONNX session is created in the model's
+/// constructor. Same idiom as `probe_shape` above, for the same reason.
+int run_gpu = 0;
+
 bool truthy(const std::string& v) { return v == "1" || v == "true" || v == "on"; }
 
 /// Arity, checked with the node's NAME in the message. GraphBuilder checks it too, but
@@ -179,7 +188,7 @@ void register_types() {
         mc.path = c.get("onnx");
         if (mc.path.empty()) throw std::runtime_error("node '" + c.name + "': param onnx= is required");
         mc.provider = c.get("provider", "cuda");
-        mc.device_id = c.get_int("device", 0);
+        mc.device_id = run_gpu;          // policy, not a node param (see run_gpu)
         mc.max_batch = c.get_int("batch", 8);
         mc.fp16 = truthy(c.get("fp16", "0"));
         mc.engine_cache = c.get("engine_cache");
@@ -308,6 +317,9 @@ int main(int argc, char** argv) {
         probe_shape = {probe.H, probe.W};
     }
 
+    // BEFORE build(): the model node's factory reads `run_gpu` to construct the session.
+    run_gpu = spec.get_int("gpu", 0);
+
     register_types();
     const auto t0 = clk::now();
     arandu::Graph g;
@@ -328,6 +340,7 @@ int main(int argc, char** argv) {
     pol.determinism = spec.get("determinism", "tolerant") == "bitexact"
                           ? arandu::Determinism::BitExact : arandu::Determinism::Tolerant;
     pol.device = spec.get("device", "cuda") == "cpu" ? arandu::Device::Cpu : arandu::Device::Cuda;
+    pol.gpu_id = run_gpu;               // o mesmo número que a sessão ONNX recebeu
     pol.cpu_threads = spec.get_int("threads", 8);
     pol.max_batch = spec.get_int("batch", 8);
     pol.channel_depth = spec.get_int("depth", 4);

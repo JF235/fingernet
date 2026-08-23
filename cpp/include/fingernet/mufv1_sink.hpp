@@ -223,7 +223,13 @@ public:
                 // rodar duas vezes sobre o mesmo bundle escrevia os mesmos registros de
                 // novo -- 12 linhas para 6 identidades, e um índice com a mesma identidade
                 // duas vezes. Quem quer começar de zero apaga o destino.
-                if (bundle_->has(idt.iid, idt.sid)) {
+                //
+                // A CHAVE INCLUI O DEDO, porque neste modo o registro é UMA IMAGEM. Sem o
+                // fid, o segundo dedo da mesma amostra parecia já escrito: 100 imagens da
+                // TS1k (dez dedos por (iid, sid)) viravam 10 registros, e qual dos dez
+                // sobrava era quem chegasse primeiro no JOIN. Os outros 90 eram descartados
+                // como "já estavam lá".
+                if (bundle_->has(idt.iid, idt.sid, fd.meta.fid)) {
                     ++skipped_;
                     break;
                 }

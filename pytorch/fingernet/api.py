@@ -230,24 +230,32 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = True, 
         angles = np.round(np.rad2deg(result_item["orientation_field_mod"]) + 90).astype(np.uint8)
         Image.fromarray(angles).save(path)
 
-    # Minutiae before the mask filter — --full only
-    if 'minutiae_unmod' in result_item:
-        mnt_unmod = result_item["minutiae_unmod"].copy()
-        angle_ccw_deg_unmod = np.round((-np.rad2deg(mnt_unmod[:, 2])) % 360).astype(int)
-        quality_int_unmod = np.round(mnt_unmod[:, 3] * 100).astype(int)
-        mnt_unmod_out = np.column_stack([
-            mnt_unmod[:, 0].astype(int),
-            mnt_unmod[:, 1].astype(int),
-            angle_ccw_deg_unmod,
-            quality_int_unmod,
-        ])
-        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.min")
-        os.makedirs(os.path.dirname(mnt_unmod_path), exist_ok=True)
-        np.savetxt(
-            mnt_unmod_path, mnt_unmod_out,
-            fmt="%d",
-            header="X Y ANGLE QUALITY", comments="#MIN ", delimiter=" "
-        )
+def assemble_result(final_outputs: dict, i: int, orig_h: int, orig_w: int,
+                    input_path: str, full: bool = False) -> dict:
+    """One image's products, cropped back to its original size.
+
+    `orientation_field_mod` is derived here because it is exactly the mask times a
+    primitive; the other two `--full` products come from `postprocess`, which is the
+    only place that still has the float enhanced image and the unmasked score (see
+    its docstring for why neither is derivable).
+    """
+    mask = final_outputs['segmentation_mask'][i]
+    crop = lambda t: t[:orig_h, :orig_w].cpu().numpy()
+    result = {
+        'input_path': input_path,
+        'minutiae': final_outputs['minutiae'][i].cpu().numpy(),
+        'enhanced_image': crop(final_outputs['enhanced_image'][i]),
+        'segmentation_mask': crop(mask),
+        'orientation_field': crop(final_outputs['orientation_field'][i]),
+        'quality': crop(final_outputs['quality'][i]),
+    }
+    if full:
+        mask01 = (mask / 255.0).float()
+        result['enhanced_image_mod'] = crop(final_outputs['enhanced_image_mod'][i])
+        # the one product that IS the mask times a primitive
+        result['orientation_field_mod'] = crop(final_outputs['orientation_field'][i] * mask01)
+    return result
+
 
 def postprocess_and_save_batch(
     raw_outputs_cpu: dict,
@@ -266,34 +274,14 @@ def postprocess_and_save_batch(
     logger.info("CPU worker started processing batch", extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
         with FnetTimer("Post-processing", logger) as t_post:
-            final_outputs = postprocess(raw_outputs_cpu, threshold=threshold, full=full)
+            final_outputs = postprocess(raw_outputs_cpu, threshold=threshold)
 
         padded_h, padded_w = padded_shape
 
         for i in range(len(batch_paths)):
             orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
-
-            minutiae = final_outputs["minutiae"][i].numpy()
-
-            enhanced_img = final_outputs["enhanced_image"][i][:orig_h, :orig_w].numpy()
-            seg_mask = final_outputs["segmentation_mask"][i][:orig_h, :orig_w].numpy()
-            ori_field = final_outputs["orientation_field"][i][:orig_h, :orig_w].numpy()
-            quality = final_outputs["quality"][i][:orig_h, :orig_w].numpy()
-
-            result_item = {
-                "input_path": batch_paths[i],
-                "minutiae": minutiae,
-                "enhanced_image": enhanced_img,
-                "segmentation_mask": seg_mask,
-                "orientation_field": ori_field,
-                "quality": quality,
-            }
-
-            if full:
-                result_item["enhanced_image_mod"] = final_outputs["enhanced_image_mod"][i][:orig_h, :orig_w].numpy()
-                result_item["orientation_field_mod"] = final_outputs["orientation_field_mod"][i][:orig_h, :orig_w].numpy()
-                result_item["minutiae_unmod"] = final_outputs["minutiae_unmod"][i].numpy()
-
+            result_item = assemble_result(final_outputs, i, orig_h, orig_w,
+                                          batch_paths[i], full=full)
             save_results(result_item, output_path, mnt_degrees, input_base_path)
 
         
@@ -318,8 +306,7 @@ def create_output_directories(output_path: str, full: bool = False):
     confidence).
 
     Optional (``full=True``):
-        Also creates ``enhanced_mod/``, ``ori_mod/`` (mask-modulated)
-        and ``minutiae_unmod/`` (without the mask filter).
+        Also creates ``enhanced_mod/`` and ``ori_mod/`` (mask-modulated).
     """
     os.makedirs(os.path.join(output_path, "minutiae"), exist_ok=True)
     os.makedirs(os.path.join(output_path, "mask"), exist_ok=True)
@@ -329,7 +316,6 @@ def create_output_directories(output_path: str, full: bool = False):
     if full:
         os.makedirs(os.path.join(output_path, "enhanced_mod"), exist_ok=True)
         os.makedirs(os.path.join(output_path, "ori_mod"), exist_ok=True)
-        os.makedirs(os.path.join(output_path, "minutiae_unmod"), exist_ok=True)
 
 def setup_ddp(rank: int, world_size: int, local_device_idx: int, timeout_minutes: int = 30):
     """
@@ -402,24 +388,26 @@ def run_inference(
         recursive: Search for images recursively
         mnt_degrees: Save minutiae angles in degrees instead of radians
         compile_model: Use torch.compile for faster inference
-        full: also export ``enhanced_mod/``, ``ori_mod/`` (mask-modulated
-            counterparts) and ``minutiae_unmod/`` (minutiae before the
-            mask filter).
+        full: also export ``enhanced_mod/`` and ``ori_mod/`` (the mask-modulated
+            counterparts).
 
     Example:
         >>> run_inference('images/', 'output/', gpus=2, batch_size=8)
     """
     image_paths = find_image_paths(input_path, recursive)
 
-    # Determine the base path for preserving directory structure
-    # If input_path is a directory, use it as base
-    # If it's a file or list, use its parent directory
+    # Base path for preserving directory structure under output_path.
+    #
+    # For a directory, that is the directory. For a .txt list it is NOT the list's own
+    # directory: the list can live anywhere, and a base the images are not under makes
+    # save_results' relpath emit "../.." — every product then lands OUTSIDE output_path,
+    # and because the five per-image products differ only by their leading directory,
+    # they collapse onto one filename and overwrite each other. Silent 4/5 data loss.
+    # The common ancestor of the images themselves is the base that cannot do that.
     if os.path.isdir(input_path):
         input_base_path = input_path
-    elif os.path.isfile(input_path):
-        input_base_path = os.path.dirname(input_path)
     else:
-        input_base_path = None
+        input_base_path = os.path.commonpath([os.path.dirname(p) for p in image_paths])
 
     # Collect all config into one dict for convenience
     config = locals()
@@ -683,25 +671,13 @@ class InferenceRunner:
                     final_outputs = self.model(
                         batch_tensors,
                         minutiae_threshold=self.config.get('threshold', 0.05),
-                        full=_full,
                     )
 
                     # --- D2H + COLLECT (cheap) ---
                     for i in range(len(batch_paths)):
                         orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
-                        result_item = {
-                            'input_path': batch_paths[i],
-                            'minutiae': final_outputs['minutiae'][i].cpu().numpy(),
-                            'enhanced_image': final_outputs['enhanced_image'][i][:orig_h, :orig_w].cpu().numpy(),
-                            'segmentation_mask': final_outputs['segmentation_mask'][i][:orig_h, :orig_w].cpu().numpy(),
-                            'orientation_field': final_outputs['orientation_field'][i][:orig_h, :orig_w].cpu().numpy(),
-                            'quality': final_outputs['quality'][i][:orig_h, :orig_w].cpu().numpy(),
-                        }
-                        if _full:
-                            result_item['enhanced_image_mod'] = final_outputs['enhanced_image_mod'][i][:orig_h, :orig_w].cpu().numpy()
-                            result_item['orientation_field_mod'] = final_outputs['orientation_field_mod'][i][:orig_h, :orig_w].cpu().numpy()
-                            result_item['minutiae_unmod'] = final_outputs['minutiae_unmod'][i].cpu().numpy()
-                        save_chunk.append(result_item)
+                        save_chunk.append(assemble_result(
+                            final_outputs, i, orig_h, orig_w, batch_paths[i], full=_full))
 
                     # --- DISPATCH SAVE CHUNK ---
                     if len(save_chunk) >= chunk_size:

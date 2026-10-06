@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from scipy import signal
 import os
-import kornia
+
 from .fnet_utils import get_fingernet_logger, FnetTimer, logging, DEFAULT_DEVICE, DEFAULT_WEIGHTS_PATH
 
 logger = get_fingernet_logger(__name__, level=logging.INFO)
@@ -167,6 +167,21 @@ class MinutiaeHead(nn.Module):
 
 class FingerNet(nn.Module):
     """Complete FingerNet model — orchestrates the data flow across blocks."""
+
+    #: What forward() returns, in export order. The post-processing reads all of it.
+    #:
+    #: The four `*_index` are argmax planes [B,h,w], not the channel stacks the heads
+    #: produce: orientation (90 bins), minutiae orientation (180) and the two 8-bin
+    #: sub-block offsets are read by exactly one operation each, argmax over the
+    #: channel axis. Reducing here rather than in every consumer is what lets the
+    #: hybrid strategy and the ONNX export move 1.15 MB per 512x512 image instead of
+    #: 5.77 -- 286 of the 288 coarse channels existed only to become four numbers per
+    #: cell. It also costs nothing: the full-plane argmax is one fused kernel over the
+    #: batch (0.0022 ms/img), against 0.1187 ms for the per-image gather it replaces.
+    OUTPUTS = ('enhanced_real', 'segmentation', 'orientation_index',
+               'minutiae_orientation_index', 'minutiae_x_index', 'minutiae_y_index',
+               'minutiae_score')
+
     def __init__(self):
         super().__init__()
         self.img_norm = ImgNormalization()
@@ -191,72 +206,41 @@ class FingerNet(nn.Module):
         enh_real, _, _ = self.enhancement_module(x, ori_map)
         return enh_real
 
-    def forward(self, x: torch.Tensor):
-        """Define the data flow and return a dict with all outputs."""
-        # Pipeline stages
-        x_norm = self.img_norm(x)
-        features = self.feature_extractor(x_norm)
-
-        ori_map, seg_map = self.ori_seg_head(features)
-
-        enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
-
-        upsampled_seg = F.interpolate(nn.functional.softsign(seg_map), scale_factor=8, mode='nearest')
-        upsampled_seg_out = F.interpolate(seg_map, scale_factor=8, mode='nearest')
-
-        minutiae_input = torch.cat([enh_phase, upsampled_seg], dim=1)
-        
-        mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
-
-        # Return a dict with named outputs for clarity
-        return {
-            'orientation upsample': upsampled_ori_map,
-            'segmentation upsample': upsampled_seg_out,
-            'segmentation': seg_map,
-            'orientation': ori_map,
-            'enhanced_real': enh_real,
-            'enhanced_phase': enh_phase,
-            'minutiae_orientation': mnt_o,
-            'minutiae_x_offset': mnt_w,
-            'minutiae_y_offset': mnt_h,
-            'minutiae_score': mnt_s
-        }
-
-    def time(self, x: torch.Tensor):
-        """Define the data flow and return a dict with all outputs."""
-        # Pipeline stages
-
+    def forward(self, x: torch.Tensor, profile: bool = False):
+        """Return the OUTPUTS dict. `profile=True` times each stage (DEBUG log)."""
         x_norm = self.img_norm(x)
 
-        with FnetTimer("Feature Extraction", logger):
+        with FnetTimer("Feature Extraction", logger, profile):
             features = self.feature_extractor(x_norm)
 
-        with FnetTimer("Orientation and Segmentation Head", logger):
+        with FnetTimer("Orientation and Segmentation Head", logger, profile):
             ori_map, seg_map = self.ori_seg_head(features)
 
-        with FnetTimer("Enhancement Module", logger):
-            enh_real, enh_phase, upsampled_ori_map = self.enhancement_module(x, ori_map)
+        with FnetTimer("Enhancement Module", logger, profile):
+            # 3rd return is the 90-channel full-res orientation map: an internal of
+            # the Gabor selection, 221 MB/image if returned, read by no consumer.
+            enh_real, enh_phase, _ = self.enhancement_module(x, ori_map)
 
-        upsampled_seg = F.interpolate(nn.functional.softsign(seg_map), scale_factor=8, mode='nearest')
-        upsampled_seg_out = F.interpolate(seg_map, scale_factor=8, mode='nearest')
-
+        upsampled_seg = F.interpolate(F.softsign(seg_map), scale_factor=8, mode='nearest')
         minutiae_input = torch.cat([enh_phase, upsampled_seg], dim=1)
-        
-        with FnetTimer("Minutiae Head", logger):
+
+        with FnetTimer("Minutiae Head", logger, profile):
             mnt_o, mnt_w, mnt_h, mnt_s = self.minutiae_head(minutiae_input, ori_map)
 
-        # Return a dict with named outputs for clarity
+        # int32, not the default int64: it halves what crosses the device boundary,
+        # and 180 bins fit with room to spare. torch.argmax and ONNX ArgMax
+        # (select_last_index=0) both return the FIRST maximal index, which is the tie
+        # rule the C++ decode assumes.
+        bin_of = lambda t: torch.argmax(t, dim=1).to(torch.int32)
+
         return {
-            'orientation upsample': upsampled_ori_map,
-            'segmentation upsample': upsampled_seg_out,
-            'segmentation': seg_map,
-            'orientation': ori_map,
             'enhanced_real': enh_real,
-            'enhanced_phase': enh_phase,
-            'minutiae_orientation': mnt_o,
-            'minutiae_x_offset': mnt_w,
-            'minutiae_y_offset': mnt_h,
-            'minutiae_score': mnt_s
+            'segmentation': seg_map,
+            'orientation_index': bin_of(ori_map),
+            'minutiae_orientation_index': bin_of(mnt_o),
+            'minutiae_x_index': bin_of(mnt_w),
+            'minutiae_y_index': bin_of(mnt_h),
+            'minutiae_score': mnt_s,
         }
 
 def get_fingernet_core(weights_path: str = DEFAULT_WEIGHTS_PATH, device: str = DEFAULT_DEVICE) -> FingerNet:

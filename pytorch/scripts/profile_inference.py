@@ -189,13 +189,16 @@ def instrumented_step(
         with gtimer.stage("net_minutiae_head"):
             mnt_o, mnt_w, mnt_h, mnt_s = fnet.minutiae_head(minutiae_input, ori_map)
 
+    # This script drives the blocks by hand to time them, so it has to reassemble
+    # what FingerNet.forward returns -- including the decode's argmax (see OUTPUTS).
+    bin_of = lambda t: torch.argmax(t, dim=1).to(torch.int32)
     raw_outputs = {
         "segmentation": seg_map,
-        "orientation": ori_map,
+        "orientation_index": bin_of(ori_map),
         "enhanced_real": enh_real,
-        "minutiae_orientation": mnt_o,
-        "minutiae_x_offset": mnt_w,
-        "minutiae_y_offset": mnt_h,
+        "minutiae_orientation_index": bin_of(mnt_o),
+        "minutiae_x_index": bin_of(mnt_w),
+        "minutiae_y_index": bin_of(mnt_h),
         "minutiae_score": mnt_s,
     }
 
@@ -208,11 +211,11 @@ def instrumented_step(
 
     with gtimer.stage("post_minutiae_detect_nms"):
         final_minutiae_list = _post_detect_minutiae(
-            raw_outputs, cleaned_mask, threshold
+            raw_outputs, threshold, cleaned_mask
         )
 
     with gtimer.stage("post_orientation_field"):
-        ori_idx = torch.argmax(raw_outputs["orientation"], dim=1)
+        ori_idx = raw_outputs["orientation_index"]
         ori_idx_up = F.interpolate(
             ori_idx.unsqueeze(1).float(), scale_factor=8, mode="nearest"
         ).squeeze(1)

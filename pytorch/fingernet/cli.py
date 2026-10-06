@@ -204,7 +204,7 @@ Examples:
         sp.add_argument('--max-dim', type=int, default=1024, help='Maximum dimension (H or W) for an image before resizing (default: 1024)')
         sp.add_argument('--strategy',  type=str, default='full_gpu', choices=['hybrid', 'full_gpu'], help="Execution strategy: 'full_gpu' (default, ~4× faster than hybrid on H100) or 'hybrid' (GPU inference, CPU post-processing).")
         sp.add_argument('--cpu-workers', type=int, default=4, help='Number of CPU threads for post-processing in hybrid mode and for saving results (default: 4)')
-        sp.add_argument('--full', action='store_true', help='Full extraction: besides the 5 default outputs, also exports enhanced_mod/, ori_mod/ and minutiae_unmod/')
+        sp.add_argument('--full', action='store_true', help='Full extraction: besides the 5 default outputs, also exports enhanced_mod/ and ori_mod/')
 
     if any(h in sys.argv for h in ('-h', '--help')) and not any(cmd in sys.argv for cmd in subcommand_names):
         subparsers_temp = parser.add_subparsers(dest='command', required=False, help='Command to execute')
